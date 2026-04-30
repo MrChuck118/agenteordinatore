@@ -1,0 +1,45 @@
+# ── Segreti e configurazioni private ──────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+
+# ── Ambiente virtuale Python ──────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Cache Python ──────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / distribuzione
+build/
+dist/
+installer/Output/
+*.manifest
+
+# ── Dati utente / cronologia personale ────────────────────────────
+history.json
+*.log
+
+# ── Configurazioni IDE / tooling personali ────────────────────────
+.vscode/
+.idea/
+.claude/
+
+# ── File temporanei / sistema ─────────────────────────────────────
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── Cache HuggingFace locale (non dovrebbe esserci ma per sicurezza) ──
+.cache/
+models/

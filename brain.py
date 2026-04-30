@@ -1,0 +1,602 @@
+"""
+brain.py — Classificazione intelligente dei file.
+
+Usa un modello locale Qwen3.5 (GGUF) tramite llama-cpp-python.
+"""
+
+import json
+import re
+import subprocess
+
+from model_manager import MODELS, get_model_path
+from utils import format_size, sanitize_category
+from logger import get_app_logger
+
+_log = get_app_logger()
+
+
+# ── Strategia per tier ──────────────────────────────────────────────
+# chunk_size   : dimensione massima del chunk del torneo nel multi-swap
+# n_ctx        : context window passata a llama-cpp (KV cache cresce lineare)
+# sample_files : numero massimo di nomi file campione mostrati al modello
+#                per ogni cartella (sia binary swap che multi-swap)
+
+TIER_STRATEGY = {
+    "lite":     {"chunk_size": 2, "n_ctx": 4096,  "sample_files": 10},
+    "standard": {"chunk_size": 4, "n_ctx": 8192,  "sample_files": 20},
+    "pro":      {"chunk_size": 6, "n_ctx": 8192,  "sample_files": 25},
+    "ultra":    {"chunk_size": 8, "n_ctx": 16384, "sample_files": 30},
+}
+
+
+def get_tier_strategy(tier: str) -> dict:
+    """Ritorna la strategia per il tier indicato, fallback su 'standard'."""
+    return TIER_STRATEGY.get(tier, TIER_STRATEGY["standard"])
+
+
+# ── Prompt di sistema per il modello locale ─────────────────────────
+
+CLASSIFY_SYSTEM_PROMPT = """You are a file classifier. Given a filename and size, respond with ONLY a JSON object.
+Rules:
+- Respond ONLY with valid JSON, no other text
+- Format: {"category": "FolderName/SubfolderName"}
+- Use 1-2 levels max (e.g. "Images/Photos", "Documents/PDF", "Code/Python")
+- 0 byte files go in "Corrupted/Empty"
+- Categories in Italian or English based on filename language
+
+Examples:
+filename: "foto_vacanza_2024.jpg", size: "2.5 MB" -> {"category": "Immagini/Foto"}
+filename: "report_Q3.xlsx", size: "145 KB" -> {"category": "Documenti/Fogli di calcolo"}
+filename: "backup.tar.gz", size: "1.2 GB" -> {"category": "Archivi/Backup"}
+filename: "main.py", size: "8 KB" -> {"category": "Codice/Python"}
+filename: "song.mp3", size: "4.1 MB" -> {"category": "Audio/Musica"}
+filename: "empty_file.dat", size: "0 B" -> {"category": "Corrotti/Vuoti"}"""
+
+SWAP_SYSTEM_PROMPT = """You classify which folder a file belongs to. Given a filename, its size, two folder names, and their contents, respond ONLY with "A" or "B".
+Rules:
+- Respond with ONLY the letter A or B, nothing else
+- Choose based on which folder's contents are most similar to the file
+- Consider file extensions, naming patterns, and themes
+
+Example:
+File: "photo_beach.jpg" (3.2 MB)
+Folder A "Vacanze": [sunset.jpg, mare.png, hotel.pdf]
+Folder B "Lavoro": [report.docx, budget.xlsx, meeting.pdf]
+-> A"""
+
+MULTI_SWAP_SYSTEM_PROMPT = """You classify which folder a file belongs to. Given a filename, its size, and a numbered list of folders with their contents, respond ONLY with the index number of the best folder.
+Rules:
+- Respond with ONLY a single integer (the index), nothing else
+- The index must be one of the listed indices (0, 1, 2, ...)
+- Choose based on which folder's contents are most similar to the file
+- Consider file extensions, naming patterns, themes, and folder name
+
+Example with 2 folders:
+File: "photo_beach.jpg" (3.2 MB)
+0: Vacanze (D:/foto/Vacanze) -> [sunset.jpg, mare.png, hotel.pdf]
+1: Lavoro (D:/docs/Lavoro) -> [report.docx, budget.xlsx, meeting.pdf]
+-> 0
+
+Example with 4 folders:
+File: "main.py" (8 KB)
+0: Documenti (C:/Users/me/Documenti) -> [cv.pdf, lettera.docx]
+1: Codice (D:/dev/Codice) -> [app.js, server.py, README.md]
+2: Foto (E:/media/Foto) -> [vacanza.jpg, ritratto.png]
+3: Musica (E:/media/Musica) -> [song.mp3, album.flac]
+-> 1
+
+Example with 3 folders:
+File: "report_Q3.xlsx" (145 KB)
+0: Vacanze2024 (D:/foto/Vacanze2024) -> [mare.jpg, hotel.pdf]
+1: Lavoro (D:/docs/Lavoro) -> [budget.xlsx, contratto.pdf]
+2: Backup (E:/backup) -> [archive.tar.gz, dump.sql]
+-> 1"""
+
+
+# ── Classificatore locale ───────────────────────────────────────────
+
+class LocalClassifier:
+    def __init__(self, tier: str = "standard"):
+        self.tier = tier
+        self.model = None
+
+    def _get_gpu_layers(self) -> int:
+        """Ritorna -1 solo se la VRAM libera sembra sufficiente per il tier."""
+        required_gb = MODELS[self.tier]["size_bytes"] / (1024 ** 3) + 0.5
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.total,memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                best_free_gb = 0.0
+                for line in result.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    best_free_gb = max(best_free_gb, float(parts[1]) / 1024)
+
+                if best_free_gb >= required_gb:
+                    return -1
+
+                _log.warning(
+                    "GPU offload disattivato: VRAM libera %.1f GB, richiesta stimata %.1f GB",
+                    best_free_gb,
+                    required_gb,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            pass
+        return 0
+
+    def _ensure_loaded(self):
+        """Carica il modello se non gia' in memoria."""
+        if self.model is not None:
+            return
+
+        from llama_cpp import Llama
+
+        model_path = get_model_path(self.tier)
+        if not model_path.exists():
+            _log.error("Modello tier=%s non trovato in %s", self.tier, model_path)
+            raise FileNotFoundError(
+                f"Modello {self.tier} non scaricato. "
+                "Scaricalo prima dalle Impostazioni."
+            )
+
+        from config import load_config
+        config = load_config()
+        gpu_layers = self._get_gpu_layers() if config.get("gpu_offload", True) else 0
+
+        strategy = get_tier_strategy(self.tier)
+        n_ctx_target = strategy["n_ctx"]
+
+        _log.info(
+            "Caricamento modello tier=%s gpu_layers=%s n_ctx=%d chunk_size=%d sample_files=%d",
+            self.tier, gpu_layers, n_ctx_target,
+            strategy["chunk_size"], strategy["sample_files"],
+        )
+
+        # Tentativo di caricamento con fallback graceful: se il context richiesto
+        # non sta in memoria (RAM/VRAM insufficiente), riprova dimezzando finche'
+        # non scende sotto un minimo ragionevole.
+        n_ctx_min = 2048
+        n_ctx = n_ctx_target
+        last_exc = None
+        while n_ctx >= n_ctx_min:
+            try:
+                self.model = Llama(
+                    model_path=str(model_path),
+                    n_ctx=n_ctx,
+                    n_threads=None,
+                    n_gpu_layers=gpu_layers,
+                    verbose=False,
+                )
+                if n_ctx != n_ctx_target:
+                    _log.warning(
+                        "Caricamento Llama riuscito con n_ctx=%d (richiesto=%d) dopo fallback",
+                        n_ctx, n_ctx_target,
+                    )
+                else:
+                    _log.info("Modello tier=%s caricato (n_ctx=%d)", self.tier, n_ctx)
+                self._effective_n_ctx = n_ctx
+                return
+            except Exception as e:
+                last_exc = e
+                next_ctx = n_ctx // 2
+                if next_ctx < n_ctx_min:
+                    break
+                _log.warning(
+                    "Caricamento Llama con n_ctx=%d fallito (%s), retry con n_ctx=%d",
+                    n_ctx, type(e).__name__, next_ctx,
+                )
+                n_ctx = next_ctx
+
+        if last_exc is not None:
+            _log.error(
+                "Caricamento modello fallito (tier=%s, n_ctx=%d)",
+                self.tier,
+                n_ctx_target,
+                exc_info=(type(last_exc), last_exc, last_exc.__traceback__),
+            )
+        else:
+            _log.error("Caricamento modello fallito (tier=%s, n_ctx=%d)", self.tier, n_ctx_target)
+        raise last_exc if last_exc is not None else RuntimeError("Caricamento modello fallito")
+
+    def unload(self):
+        """Scarica il modello dalla memoria."""
+        self.model = None
+
+    @staticmethod
+    def _parse_category(response_text: str) -> str:
+        """Estrae la categoria dalla risposta del modello, con fallback robusti."""
+        text = response_text.strip()
+
+        # Tentativo 1: parse JSON diretto
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "category" in data:
+                return data["category"]
+        except json.JSONDecodeError:
+            pass
+
+        # Tentativo 2: trova JSON dentro testo sporco
+        json_match = re.search(r'\{[^}]+\}', text)
+        if json_match:
+            try:
+                data = json.loads(json_match.group())
+                if isinstance(data, dict) and "category" in data:
+                    return data["category"]
+            except json.JSONDecodeError:
+                pass
+
+        # Tentativo 3: cerca pattern "category": "valore"
+        cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', text)
+        if cat_match:
+            return cat_match.group(1)
+
+        _log.warning("Parsing categoria fallito, fallback 'Altro'. Risposta modello: %r", text[:200])
+        return "Altro"
+
+    @staticmethod
+    def _parse_swap(response_text: str) -> str:
+        """Estrae A o B dalla risposta."""
+        text = response_text.strip().upper()
+        if text in ("A", "B"):
+            return text
+
+        match = re.search(r"\b([AB])\b", text)
+        if match:
+            return match.group(1)
+
+        _log.warning("Parsing swap ambiguo, fallback 'A'. Risposta modello: %r", text[:200])
+        return "A"
+
+    @staticmethod
+    def _parse_index(response_text: str, valid_count: int) -> int:
+        """
+        Estrae un indice intero dalla risposta del modello, con range check.
+
+        Pipeline:
+            1) int diretto del testo strip()
+            2) regex \\b(\\d+)\\b sul testo
+            3) range check: 0 <= idx < valid_count
+            4) fallback 0 con warning
+
+        Args:
+            response_text: testo prodotto dal modello.
+            valid_count: numero di opzioni proposte (es. len(folder_specs)).
+
+        Returns:
+            Indice intero valido nell'intervallo [0, valid_count - 1].
+        """
+        text = response_text.strip()
+
+        # Tentativo 1: int diretto
+        try:
+            idx = int(text)
+            if 0 <= idx < valid_count:
+                return idx
+            _log.warning(
+                "Indice modello fuori range (got=%d, max=%d) - fallback a 0. Risposta: %r",
+                idx, valid_count - 1, text[:200],
+            )
+            return 0
+        except ValueError:
+            pass
+
+        # Tentativo 2: regex su numero nel testo
+        match = re.search(r"\b(\d+)\b", text)
+        if match:
+            try:
+                idx = int(match.group(1))
+                if 0 <= idx < valid_count:
+                    return idx
+                _log.warning(
+                    "Indice modello fuori range (got=%d, max=%d) - fallback a 0. Risposta: %r",
+                    idx, valid_count - 1, text[:200],
+                )
+                return 0
+            except ValueError:
+                pass
+
+        _log.warning("Parsing indice fallito - fallback a 0. Risposta modello: %r", text[:200])
+        return 0
+
+    def classify_file(self, filename: str, file_size) -> str:
+        """Classifica un file e ritorna la categoria."""
+        self._ensure_loaded()
+
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        user_message = f'filename: "{filename}", size: "{size_str}"'
+
+        response = self.model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=100,
+            temperature=0.1,
+            stop=["\n\n"],
+        )
+
+        result_text = response["choices"][0]["message"]["content"]
+        category = sanitize_category(self._parse_category(result_text))
+        _log.debug("classify_file: %s (%s) -> %s", filename, size_str, category)
+        return category
+
+    def classify_for_swap(
+        self, filename, file_size, folder_a_name, folder_b_name,
+        folder_a_files, folder_b_files
+    ) -> str:
+        """Classifica per swap. Ritorna 'A' o 'B'."""
+        self._ensure_loaded()
+
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        sample_files = get_tier_strategy(self.tier)["sample_files"]
+        files_a = ", ".join(folder_a_files[:sample_files])
+        files_b = ", ".join(folder_b_files[:sample_files])
+
+        user_message = (
+            f'File: "{filename}" ({size_str})\n'
+            f'Folder A "{folder_a_name}": [{files_a}]\n'
+            f'Folder B "{folder_b_name}": [{files_b}]'
+        )
+
+        response = self.model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SWAP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=10,
+            temperature=0.1,
+            stop=["\n"],
+        )
+
+        result_text = response["choices"][0]["message"]["content"]
+        choice = self._parse_swap(result_text)
+        _log.debug("classify_for_swap: %s -> %s", filename, choice)
+        return choice
+
+    @staticmethod
+    def _short_path(path_str: str, segments: int = 3) -> str:
+        """
+        Restituisce gli ultimi `segments` segmenti di un path, prefissati con '...'
+        se il path ne ha di piu'. Serve per disambiguare cartelle con stesso nome
+        nel prompt senza saturare il context con path lunghissimi.
+        """
+        if not path_str:
+            return ""
+        # Normalizza separatori
+        norm = path_str.replace("\\", "/").rstrip("/")
+        parts = [p for p in norm.split("/") if p]
+        if len(parts) <= segments:
+            # Mantieni il prefisso (es. drive su Windows o '/' su POSIX)
+            return path_str
+        tail = "/".join(parts[-segments:])
+        return f".../{tail}"
+
+    def classify_best_of_n(
+        self, filename: str, file_size,
+        folder_specs: list[dict],
+    ) -> int:
+        """
+        Singola chiamata K-aria: dato un file e una lista di K cartelle candidate,
+        ritorna l'indice (0..K-1) della cartella scelta dal modello.
+
+        Args:
+            filename: nome del file da classificare.
+            file_size: dimensione (int) o stringa formattata.
+            folder_specs: lista di dict con chiavi:
+                - "name": nome leggibile della cartella
+                - "path": path completo (per disambiguare cartelle con stesso nome)
+                - "files": lista di nomi file campione (senza il file target)
+
+        Returns:
+            Indice intero in [0, len(folder_specs) - 1].
+        """
+        self._ensure_loaded()
+
+        if not folder_specs:
+            raise ValueError("folder_specs vuoto")
+        if len(folder_specs) == 1:
+            return 0
+
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        sample_files = get_tier_strategy(self.tier)["sample_files"]
+
+        lines = [f'File: "{filename}" ({size_str})']
+        for idx, spec in enumerate(folder_specs):
+            name = spec.get("name", "")
+            short = self._short_path(spec.get("path", ""))
+            files_sample = ", ".join((spec.get("files") or [])[:sample_files])
+            label = f"{name} ({short})" if short else name
+            lines.append(f"{idx}: {label} -> [{files_sample}]")
+        user_message = "\n".join(lines)
+
+        response = self.model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": MULTI_SWAP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=10,
+            temperature=0.1,
+            stop=["\n"],
+        )
+        result_text = response["choices"][0]["message"]["content"]
+        idx = self._parse_index(result_text, len(folder_specs))
+        _log.debug(
+            "classify_best_of_n: '%s' -> idx=%d (%s)",
+            filename, idx, folder_specs[idx].get("name", "?"),
+        )
+        return idx
+
+    def classify_for_multi_swap(
+        self, filename: str, file_size,
+        folder_specs: list[dict],
+        target_path: str | None = None,
+    ) -> int:
+        """
+        Decide la cartella di destinazione di un file tra N candidate, usando
+        un torneo a chunk se N supera il chunk_size del tier.
+
+        Args:
+            filename: nome del file.
+            file_size: dimensione.
+            folder_specs: lista (almeno 1 elemento) di dict come in classify_best_of_n.
+                Il chiamante DEVE gia' aver escluso il file target dai sample
+                (per path completo, non solo per nome).
+            target_path: opzionale, path completo del file target. Solo per logging.
+
+        Returns:
+            Indice intero in [0, len(folder_specs) - 1] della cartella scelta
+            nella lista ORIGINALE (non nei chunk).
+        """
+        self._ensure_loaded()
+
+        n = len(folder_specs)
+        if n == 0:
+            raise ValueError("folder_specs vuoto")
+        if n == 1:
+            return 0
+
+        chunk_size = max(2, get_tier_strategy(self.tier)["chunk_size"])
+
+        # Caso semplice: tutto in un chunk solo
+        if n <= chunk_size:
+            _log.debug(
+                "Tournament for '%s' start: %d candidate folders (single chunk)",
+                filename, n,
+            )
+            winner = self.classify_best_of_n(filename, file_size, folder_specs)
+            _log.debug(
+                "MultiSwap: '%s' -> idx=%d (%s) [1 call]",
+                filename, winner, folder_specs[winner].get("name", "?"),
+            )
+            return winner
+
+        # Torneo a piu' round
+        _log.debug(
+            "Tournament for '%s' start: %d candidate folders, chunk_size=%d",
+            filename, n, chunk_size,
+        )
+
+        # Mantieni mappa indice-corrente -> indice-originale
+        active_indices = list(range(n))
+        round_num = 0
+        total_calls = 0
+
+        while len(active_indices) > 1:
+            round_num += 1
+            next_active: list[int] = []
+            chunks_count = (len(active_indices) + chunk_size - 1) // chunk_size
+
+            for ci in range(chunks_count):
+                chunk_orig = active_indices[ci * chunk_size:(ci + 1) * chunk_size]
+                if len(chunk_orig) == 1:
+                    next_active.append(chunk_orig[0])
+                    continue
+                chunk_specs = [folder_specs[i] for i in chunk_orig]
+                local_winner = self.classify_best_of_n(filename, file_size, chunk_specs)
+                total_calls += 1
+                orig_winner = chunk_orig[local_winner]
+                _log.debug(
+                    "Tournament round %d chunk %d/%d: %s -> winner orig_idx=%d (%s)",
+                    round_num, ci + 1, chunks_count,
+                    [folder_specs[i].get("name", "?") for i in chunk_orig],
+                    orig_winner, folder_specs[orig_winner].get("name", "?"),
+                )
+                next_active.append(orig_winner)
+
+            active_indices = next_active
+
+        final_idx = active_indices[0]
+        _log.debug(
+            "MultiSwap: '%s' -> idx=%d (%s) [%d calls, %d rounds]",
+            filename, final_idx, folder_specs[final_idx].get("name", "?"),
+            total_calls, round_num,
+        )
+        return final_idx
+
+
+# ── Istanza globale e interfaccia pubblica ──────────────────────────
+
+_classifier = None
+
+
+def init_classifier(tier: str = "standard"):
+    """Inizializza il classificatore locale con il tier specificato."""
+    global _classifier
+    if _classifier is not None and _classifier.tier == tier:
+        return
+    if _classifier is not None:
+        _classifier.unload()
+    _classifier = LocalClassifier(tier=tier)
+
+
+def classify_file(filename: str, file_size="") -> str:
+    """Classifica un file e ritorna la categoria."""
+    global _classifier
+    if _classifier is None:
+        from config import get_selected_tier
+        init_classifier(get_selected_tier())
+    return _classifier.classify_file(filename, file_size)
+
+
+def classify_for_swap(
+    filename, file_size, folder_a_name, folder_b_name,
+    folder_a_files, folder_b_files
+) -> str:
+    """Classifica per swap. Ritorna 'A' o 'B'."""
+    global _classifier
+    if _classifier is None:
+        from config import get_selected_tier
+        init_classifier(get_selected_tier())
+    return _classifier.classify_for_swap(
+        filename, file_size, folder_a_name, folder_b_name,
+        folder_a_files, folder_b_files,
+    )
+
+
+def classify_for_multi_swap(
+    filename: str, file_size,
+    folder_specs: list[dict],
+    target_path: str | None = None,
+) -> int:
+    """
+    Wrapper modulo: ritorna l'indice della cartella scelta tra N candidate
+    usando il torneo a chunk del tier corrente.
+
+    `folder_specs` deve gia' contenere `files` privi del file target.
+    """
+    global _classifier
+    if _classifier is None:
+        from config import get_selected_tier
+        init_classifier(get_selected_tier())
+    return _classifier.classify_for_multi_swap(
+        filename, file_size, folder_specs, target_path=target_path,
+    )
+
+
+def unload_model():
+    """Libera la memoria del modello."""
+    global _classifier
+    if _classifier:
+        _classifier.unload()
