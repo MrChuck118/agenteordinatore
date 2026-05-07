@@ -21,13 +21,19 @@ Il dry run mostra le operazioni che verrebbero eseguite senza toccare il disco.
 import argparse
 from pathlib import Path
 
-from utils import scan_folder, move_file, copy_file, format_size, sanitize_category
-from brain import classify_file, classify_for_swap, classify_for_multi_swap, init_classifier
+from utils import (
+    scan_folder, move_file, copy_file, format_size, sanitize_category,
+    build_folder_profile, rename_folder_safe,
+)
+from brain import (
+    classify_file, classify_for_swap, classify_for_multi_swap,
+    suggest_folder_rename, init_classifier,
+)
 from model_manager import (
     MODELS, is_model_downloaded, download_model, delete_model,
     get_downloaded_models,
 )
-from config import get_selected_tier
+from config import get_selected_tier, is_folder_rename_allowed
 from logger import get_app_logger
 
 log = get_app_logger()
@@ -352,6 +358,91 @@ def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False)
     print(f"{'=' * 60}\n")
 
 
+def _folder_rename_targets(root_folder: Path, include_root: bool = False) -> list[Path]:
+    """Ritorna root opzionale + sottocartelle immediate ordinate."""
+    targets: list[Path] = []
+    if include_root:
+        targets.append(root_folder)
+    targets.extend(
+        item for item in sorted(root_folder.iterdir())
+        if item.is_dir() and not item.name.startswith(".")
+    )
+    return targets
+
+
+def rename_folders(root_folder: Path, dry_run: bool = True, include_root: bool = False) -> None:
+    """Propone e applica rename prudenti per cartelle esistenti."""
+    if not is_folder_rename_allowed():
+        print("  Rinomina cartelle disabilitata nelle Impostazioni.")
+        print("  Abilita allow_folder_rename dalla GUI prima di eseguire questa modalita.")
+        return
+
+    log.info(
+        "CLI RenameFolders avviato: root=%s dry_run=%s include_root=%s",
+        root_folder, dry_run, include_root,
+    )
+
+    targets = _folder_rename_targets(root_folder, include_root=include_root)
+    if not targets:
+        print("  Nessuna cartella da analizzare.")
+        return
+
+    print(f"\n{'=' * 60}")
+    print("  Agent Ordinatore - Rinomina cartelle")
+    print(f"  Radice: {root_folder.resolve()}")
+    print(f"  Modalita: {'DRY RUN (simulazione)' if dry_run else 'ESECUZIONE REALE'}")
+    print(f"  Cartelle candidate: {len(targets)}")
+    print(f"{'=' * 60}\n")
+
+    results: list[dict] = []
+    for folder in targets:
+        profile = build_folder_profile(folder)
+        suggestion = suggest_folder_rename(profile)
+        item = {
+            "path": str(folder),
+            "current_name": folder.name,
+            **suggestion,
+        }
+        results.append(item)
+
+        action = suggestion["action"].upper()
+        confidence = suggestion["confidence"]
+        suggested = suggestion["suggested_name"]
+        print(f"  [{action}] {folder.name} -> {suggested} ({confidence:.2f})")
+        print(f"        {suggestion['reason']}")
+
+    selected = [r for r in results if r["action"] == "rename"]
+    if not selected:
+        print("\n  Nessuna rinomina proposta.")
+        return
+
+    if dry_run:
+        print("\n  Nessuna cartella e' stata modificata (modalita dry run).")
+        print("  Rilancia con --execute per eseguire.")
+        return
+
+    renamed_count = 0
+    failed_count = 0
+    # Se include_root e sottocartelle sono insieme, rinomina prima i path piu' profondi.
+    selected.sort(key=lambda item: len(Path(item["path"]).parts), reverse=True)
+    for item in selected:
+        source = Path(item["path"])
+        try:
+            final_path = rename_folder_safe(source, item["suggested_name"])
+            renamed_count += 1
+            print(f"  [OK] {source} -> {final_path}")
+        except Exception as exc:
+            failed_count += 1
+            log.exception("CLI RenameFolders: errore rename %s", source)
+            print(f"  [ERRORE] {source}: {exc}")
+
+    log.info(
+        "CLI RenameFolders completato: %d rinominate, %d errori",
+        renamed_count, failed_count,
+    )
+    print(f"\n  Riepilogo: {renamed_count} cartelle rinominate, {failed_count} errori.\n")
+
+
 def setup_command(args) -> None:
     """Gestisce il subcommand 'setup'."""
 
@@ -514,6 +605,28 @@ def main() -> None:
         help="Tier del modello da usare (default: da configurazione)."
     )
 
+    # Subcommand: rename-folders
+    rename_parser = subparsers.add_parser(
+        "rename-folders", help="Propone nomi coerenti per cartelle esistenti."
+    )
+    rename_parser.add_argument(
+        "folder", type=str,
+        help="Cartella madre da cui analizzare le sottocartelle immediate."
+    )
+    rename_parser.add_argument(
+        "--include-root", action="store_true", default=False,
+        help="Analizza anche la cartella indicata, oltre alle sottocartelle."
+    )
+    rename_parser.add_argument(
+        "--execute", action="store_true", default=False,
+        help="Esegui le rinomine proposte (default: dry run)."
+    )
+    rename_parser.add_argument(
+        "--tier", type=str, default=None,
+        choices=["lite", "standard", "pro", "ultra"],
+        help="Tier del modello da usare (default: da configurazione)."
+    )
+
     # Subcommand: setup
     setup_parser = subparsers.add_parser(
         "setup", help="Configura hardware e modelli AI."
@@ -590,6 +703,21 @@ def main() -> None:
             return
         init_classifier(tier)
         multiswap(folders, dry_run=not args.execute, use_copy=args.copy)
+
+    elif args.command == "rename-folders":
+        root = Path(args.folder)
+        if not root.is_dir():
+            log.error("CLI RenameFolders: cartella non valida: %s", root)
+            print(f"  Errore: '{root}' non e' una cartella valida.")
+            return
+        if not is_folder_rename_allowed():
+            rename_folders(root, dry_run=not args.execute, include_root=args.include_root)
+            return
+        tier = args.tier or get_selected_tier()
+        if not _ensure_model(tier):
+            return
+        init_classifier(tier)
+        rename_folders(root, dry_run=not args.execute, include_root=args.include_root)
 
     elif args.command == "setup":
         setup_command(args)

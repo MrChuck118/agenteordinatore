@@ -16,7 +16,7 @@ Funziona offline, rispetta la privacy, gira su Windows.
 
 1. **Doppio click su `install.bat`**
 
-   Crea un ambiente Python dedicato e installa tutte le dipendenze.
+   Installa le dipendenze nel Python utente, senza usare `.venv`.
    Se hai una GPU NVIDIA con CUDA 12, usa automaticamente la wheel accelerata.
    (dura qualche minuto, la prima volta)
 
@@ -26,12 +26,15 @@ Funziona offline, rispetta la privacy, gira su Windows.
    Al primo avvio vai nel tab **Impostazioni** e scarica un modello AI
    (consigliato: *Standard* se hai almeno 6 GB di RAM).
 
-   Opzionale: esegui `crea_collegamento.ps1` da PowerShell per creare un
-   collegamento sul Desktop che punta al launcher batch.
+   Se la build portable esiste, il launcher apre direttamente l'EXE.
+
+   Opzionale: esegui `build_exe.bat` per creare `dist\Agent Ordinatore\Agent Ordinatore.exe`,
+   poi `crea_collegamento.ps1` da PowerShell per creare un collegamento sul Desktop
+   con icona.
 
 ## Utilizzo
 
-L'app ha tre modalità principali:
+L'app ha quattro modalita' principali:
 
 - **Organizza**: scegli una cartella disordinata, l'AI classifica i file
   in sottocartelle (es. `Immagini/Foto`, `Documenti/PDF`, `Codice/Python`, …)
@@ -39,15 +42,19 @@ L'app ha tre modalità principali:
   in base al loro "tema"
 - **Swap multiplo**: scegli due o piu' cartelle, l'AI sceglie per ogni file
   la cartella piu' coerente tra tutte usando un torneo a chunk calibrato sul tier
+- **Rinomina cartelle**: analizza le sottocartelle immediate di una cartella madre
+  e propone nomi piu' coerenti in base ai file contenuti, con conferma selettiva
 
-Le modalità operative hanno **anteprima** (puoi vedere dove verranno spostati i file
-prima di confermare) e opzione **Copia** invece di Sposta.
+Le modalita' operative hanno **anteprima** (puoi vedere dove verranno spostati i file
+o rinominate le cartelle prima di confermare) e opzione **Copia** invece di Sposta
+dove applicabile. La rinomina cartelle e' disattivata di default: abilitala in
+**Impostazioni -> Rinomina cartelle**.
 
 ## Cronologia e Log
 
 - Il tab **Cronologia** mostra le ultime operazioni eseguite.
-- Tutti gli spostamenti vengono tracciati in `moves.log` (cronologia completa,
-  grep-friendly).
+- Tutti gli spostamenti, le copie e le rinomine cartelle (`RENAME_FOLDER`) vengono
+  tracciati in `moves.log` (cronologia completa, grep-friendly).
 - Per aprire la cartella log: **Impostazioni → Apri cartella log**
   (è in `%LOCALAPPDATA%\AgentOrdinatore\logs\`).
 
@@ -64,12 +71,14 @@ prima di confermare) e opzione **Copia** invece di Sposta.
 Per chi preferisce la riga di comando:
 
 ```cmd
-.venv\Scripts\python.exe main.py organize "C:\Downloads"            :: dry-run
-.venv\Scripts\python.exe main.py organize "C:\Downloads" --execute  :: esegui
-.venv\Scripts\python.exe main.py swap "C:\A" "C:\B" --execute
-.venv\Scripts\python.exe main.py multiswap "C:\A" "C:\B" "C:\C"     :: dry-run
-.venv\Scripts\python.exe main.py multiswap "C:\A" "C:\B" "C:\C" --copy --execute
-.venv\Scripts\python.exe main.py setup --list
+python main.py organize "C:\Downloads"            :: dry-run
+python main.py organize "C:\Downloads" --execute  :: esegui
+python main.py swap "C:\A" "C:\B" --execute
+python main.py multiswap "C:\A" "C:\B" "C:\C"     :: dry-run
+python main.py multiswap "C:\A" "C:\B" "C:\C" --copy --execute
+python main.py rename-folders "C:\Archivio"       :: dry-run
+python main.py rename-folders "C:\Archivio" --execute
+python main.py setup --list
 ```
 
 ## Privacy

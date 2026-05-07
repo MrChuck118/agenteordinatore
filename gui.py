@@ -40,12 +40,18 @@ from PySide6.QtWidgets import (  # type: ignore
 from PySide6.QtCore import Qt, Signal, QThread, QTimer, QUrl  # type: ignore
 from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QDesktopServices  # type: ignore
 
-from utils import scan_folder, move_file, copy_file, format_size, sanitize_category
+from utils import (
+    scan_folder, move_file, copy_file, format_size, sanitize_category,
+    build_folder_profile, rename_folder_safe,
+)
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
-    init_classifier, unload_model,
+    suggest_folder_rename, init_classifier, unload_model,
 )
-from config import load_config, save_config, get_theme, set_theme, get_selected_tier, set_selected_tier
+from config import (
+    load_config, save_config, get_theme, set_theme, get_selected_tier,
+    set_selected_tier, is_folder_rename_allowed, set_folder_rename_allowed,
+)
 from model_manager import (
     MODELS, is_model_downloaded, download_model, delete_model,
     get_downloaded_models, get_models_dir
@@ -910,6 +916,94 @@ class MultiSwapExecuteWorker(QThread):
                 log.exception("Esecuzione MultiSwap: errore su %s", item.get("path"))
                 self.error.emit(i, str(e))
         log.info("Esecuzione MultiSwap completata: %d/%d riusciti", count, len(self.items))
+        self.finished.emit(count)
+
+
+class FolderRenameAnalyzeWorker(QThread):
+    """Analizza cartelle e propone nomi piu' coerenti."""
+    progress = Signal(int, str, str, str, float, str, str, str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, root_folder: Path, include_root: bool):
+        super().__init__()
+        self.root_folder = root_folder
+        self.include_root = include_root
+
+    def _targets(self) -> list[Path]:
+        targets: list[Path] = []
+        if self.include_root:
+            targets.append(self.root_folder)
+        targets.extend(
+            item for item in sorted(self.root_folder.iterdir())
+            if item.is_dir() and not item.name.startswith(".")
+        )
+        return targets
+
+    def run(self):
+        try:
+            targets = self._targets()
+            log.info(
+                "Analisi RenameFolders avviata: root=%s include_root=%s cartelle=%d",
+                self.root_folder, self.include_root, len(targets),
+            )
+            for idx, folder in enumerate(targets):
+                if self.isInterruptionRequested():
+                    log.info("Analisi RenameFolders interrotta")
+                    self.error.emit("Operazione interrotta.")
+                    return
+
+                profile = build_folder_profile(folder)
+                suggestion = suggest_folder_rename(profile)
+                self.progress.emit(
+                    idx,
+                    str(folder),
+                    folder.name,
+                    suggestion["suggested_name"],
+                    float(suggestion["confidence"]),
+                    suggestion["action"],
+                    suggestion["reason"],
+                    str(profile.get("file_count", 0)),
+                )
+            log.info("Analisi RenameFolders completata: %d cartelle", len(targets))
+            self.finished.emit()
+        except Exception as e:
+            log.exception("Analisi RenameFolders fallita")
+            self.error.emit(str(e))
+
+
+class FolderRenameExecuteWorker(QThread):
+    """Esegue rename cartelle selezionate."""
+    progress = Signal(int, str)
+    finished = Signal(int)
+    error = Signal(int, str)
+
+    def __init__(self, items: list[dict]):
+        super().__init__()
+        self.items = items
+
+    def run(self):
+        log.info("Esecuzione RenameFolders avviata: %d cartelle", len(self.items))
+        count = 0
+        ordered = sorted(
+            enumerate(self.items),
+            key=lambda pair: len(Path(pair[1]["path"]).parts),
+            reverse=True,
+        )
+        for original_idx, item in ordered:
+            if self.isInterruptionRequested():
+                log.info("Esecuzione RenameFolders interrotta: %d/%d riuscite", count, len(self.items))
+                self.finished.emit(count)
+                return
+            try:
+                source = Path(item["path"])
+                final = rename_folder_safe(source, item["suggested_name"])
+                self.progress.emit(original_idx, str(final))
+                count += 1
+            except Exception as e:
+                log.exception("Esecuzione RenameFolders: errore su %s", item.get("path"))
+                self.error.emit(original_idx, str(e))
+        log.info("Esecuzione RenameFolders completata: %d/%d riuscite", count, len(self.items))
         self.finished.emit(count)
 
 
@@ -2000,6 +2094,272 @@ class MultiSwapTab(QWidget):
 
 # ── Tab Cronologia ────────────────────────────────────────────────────
 
+class FolderRenameTab(QWidget):
+    operation_completed = Signal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self._worker = None
+        self._exec_worker = None
+        self._root_folder: Path | None = None
+        self._analyzed_items: list[dict] = []
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        folder_layout = QHBoxLayout()
+        self.drop_area = DropArea("Trascina una cartella madre qui")
+        self.drop_area.folder_dropped.connect(self._set_folder)
+        folder_layout.addWidget(self.drop_area, stretch=1)
+
+        self.browse_btn = QPushButton("Sfoglia")
+        self.browse_btn.clicked.connect(self._browse_folder)
+        folder_layout.addWidget(self.browse_btn)
+        layout.addLayout(folder_layout)
+
+        self.path_edit = QLineEdit()
+        self.path_edit.setReadOnly(True)
+        self.path_edit.setPlaceholderText("Nessuna cartella selezionata")
+        layout.addWidget(self.path_edit)
+
+        opts = QHBoxLayout()
+        self.include_root_chk = QCheckBox("Includi anche la cartella selezionata")
+        opts.addWidget(self.include_root_chk)
+        opts.addStretch()
+
+        self.analyze_btn = QPushButton("Analizza nomi")
+        self.analyze_btn.setObjectName("accentBtn")
+        self.analyze_btn.setEnabled(False)
+        self.analyze_btn.clicked.connect(self._start_analyze)
+        opts.addWidget(self.analyze_btn)
+        layout.addLayout(opts)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "", "Cartella", "Nome proposto", "Confidenza", "Decisione", "File", "Motivo"
+        ])
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 40)
+        self._select_all_checked = True
+        header.sectionClicked.connect(self._toggle_select_all)
+        layout.addWidget(self.table, stretch=1)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("statusLabel")
+        bottom.addWidget(self.status_label, stretch=1)
+
+        self.execute_btn = QPushButton("Rinomina")
+        self.execute_btn.setObjectName("accentBtn")
+        self.execute_btn.setEnabled(False)
+        self.execute_btn.clicked.connect(self._start_execute)
+        bottom.addWidget(self.execute_btn)
+        layout.addLayout(bottom)
+
+    def _set_folder(self, path: str):
+        self._root_folder = Path(path)
+        self.path_edit.setText(path)
+        self.analyze_btn.setEnabled(True)
+        self.execute_btn.setEnabled(False)
+        self.table.setRowCount(0)
+        self._analyzed_items.clear()
+        self.status_label.setText("")
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Seleziona cartella madre")
+        if folder:
+            self._set_folder(folder)
+
+    def _toggle_select_all(self, index):
+        if index != 0:
+            return
+        self._select_all_checked = not self._select_all_checked
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and (item.flags() & Qt.ItemIsUserCheckable):
+                item.setCheckState(Qt.Checked if self._select_all_checked else Qt.Unchecked)
+
+    def _start_analyze(self):
+        if not self._root_folder:
+            return
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if not is_folder_rename_allowed():
+            self.status_label.setText("Rinomina cartelle disabilitata nelle Impostazioni.")
+            return
+        if not _check_model_ready(self):
+            return
+
+        init_classifier(get_selected_tier())
+        self.table.setRowCount(0)
+        self._analyzed_items.clear()
+        self.analyze_btn.setEnabled(False)
+        self.execute_btn.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.include_root_chk.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText("Analisi nomi cartelle in corso...")
+
+        self._worker = FolderRenameAnalyzeWorker(
+            self._root_folder,
+            self.include_root_chk.isChecked(),
+        )
+        self._worker.progress.connect(self._on_analyze_progress)
+        self._worker.finished.connect(self._on_analyze_finished)
+        self._worker.error.connect(self._on_analyze_error)
+        self._worker.start()
+
+    def _on_analyze_progress(
+        self, idx, path, current_name, suggested_name, confidence, action, reason, file_count
+    ):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        should_rename = action == "rename"
+        chk = QTableWidgetItem()
+        if should_rename:
+            chk.setCheckState(Qt.Checked)
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        else:
+            chk.setCheckState(Qt.Unchecked)
+            chk.setFlags(Qt.ItemIsEnabled)
+        self.table.setItem(row, 0, chk)
+
+        decision = "Rinomina" if should_rename else "Mantieni"
+        values = [
+            current_name,
+            suggested_name,
+            f"{confidence:.2f}",
+            decision,
+            str(file_count),
+            reason,
+        ]
+        for col, text in enumerate(values, start=1):
+            table_item = QTableWidgetItem(text)
+            if not should_rename:
+                _set_item_colors(table_item, "#7a7a7a", None)
+            self.table.setItem(row, col, table_item)
+
+        self._analyzed_items.append({
+            "path": path,
+            "current_name": current_name,
+            "suggested_name": suggested_name,
+            "confidence": confidence,
+            "action": action,
+            "reason": reason,
+            "file_count": file_count,
+        })
+        self.status_label.setText(f"Analisi {idx + 1} cartelle...")
+
+    def _on_analyze_finished(self):
+        self._worker = None
+        n = len(self._analyzed_items)
+        to_rename = sum(1 for item in self._analyzed_items if item["action"] == "rename")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.status_label.setText(
+            f"Analisi completata: {n} cartelle analizzate, {to_rename} rinomine proposte."
+        )
+        self.analyze_btn.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.include_root_chk.setEnabled(True)
+        self.execute_btn.setEnabled(to_rename > 0)
+
+    def _on_analyze_error(self, msg):
+        self._worker = None
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"Errore: {msg}")
+        self.analyze_btn.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.include_root_chk.setEnabled(True)
+
+    def _start_execute(self):
+        if not is_folder_rename_allowed():
+            self.status_label.setText("Rinomina cartelle disabilitata nelle Impostazioni.")
+            return
+
+        selected = []
+        self._exec_row_map = []
+        self._exec_success_indices = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            entry = self._analyzed_items[row]
+            if entry["action"] == "rename" and item.checkState() == Qt.Checked:
+                selected.append(entry)
+                self._exec_row_map.append(row)
+
+        if not selected:
+            self.status_label.setText("Nessuna cartella selezionata.")
+            return
+
+        self.execute_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.include_root_chk.setEnabled(False)
+        self.progress_bar.setRange(0, len(selected))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setText("Rinomina cartelle in corso...")
+
+        self._exec_worker = FolderRenameExecuteWorker(selected)
+        self._exec_worker.progress.connect(self._on_exec_progress)
+        self._exec_worker.finished.connect(lambda count: self._on_exec_finished(count, selected))
+        self._exec_worker.error.connect(self._on_exec_error)
+        self._exec_worker.start()
+
+    def _on_exec_progress(self, idx, dest):
+        if not hasattr(self, "_exec_success_indices"):
+            self._exec_success_indices = []
+        self._exec_success_indices.append(idx)
+        self.progress_bar.setValue(len(self._exec_success_indices))
+        total = self.progress_bar.maximum()
+        self.status_label.setText(f"Rinomina {len(self._exec_success_indices)}/{total}...")
+
+    def _on_exec_finished(self, count, selected):
+        self._exec_worker = None
+        self.status_label.setText(f"Completato! {count} cartelle rinominate.")
+        self.analyze_btn.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.include_root_chk.setEnabled(True)
+        self.progress_bar.setValue(self.progress_bar.maximum())
+
+        success_indices = getattr(self, "_exec_success_indices", [])
+        successful = [selected[i] for i in success_indices if i < len(selected)]
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "Rinomina cartelle",
+            "folders": [str(self._root_folder)] if self._root_folder else [],
+            "mode": "Rename",
+            "file_count": count,
+            "files": [
+                {"file": s["current_name"], "from": s["current_name"], "to": s["suggested_name"]}
+                for s in successful
+            ],
+        }
+        self.operation_completed.emit(entry)
+
+    def _on_exec_error(self, idx, msg):
+        table_row = self._exec_row_map[idx] if idx < len(self._exec_row_map) else idx
+        _mark_row_error(self.table, table_row)
+
+
 class HistoryTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -2193,6 +2553,24 @@ class SettingsTab(QWidget):
 
         layout.addWidget(gpu_group)
 
+        rename_group = QGroupBox("Rinomina cartelle")
+        rename_layout = QVBoxLayout(rename_group)
+
+        self.rename_checkbox = QCheckBox("Consenti rinomina cartelle")
+        self.rename_checkbox.setChecked(config.get("allow_folder_rename", False))
+        self.rename_checkbox.stateChanged.connect(self._on_folder_rename_toggle)
+        rename_layout.addWidget(self.rename_checkbox)
+
+        rename_info = QLabel(
+            "Quando attiva, la tab Rinomina cartelle puo' proporre nuovi nomi "
+            "in base ai file contenuti. Le rinomine restano sempre selettive e confermate."
+        )
+        rename_info.setObjectName("statusLabel")
+        rename_info.setWordWrap(True)
+        rename_layout.addWidget(rename_info)
+
+        layout.addWidget(rename_group)
+
         # ── Sezione Log ──
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
@@ -2298,6 +2676,9 @@ class SettingsTab(QWidget):
         save_config(config)
         # Scarica il modello dalla memoria cosi' al prossimo uso ricarica con la nuova impostazione
         unload_model()
+
+    def _on_folder_rename_toggle(self, state):
+        set_folder_rename_allowed(bool(state))
 
     def _start_download(self):
         # Anti-doppio-click: se un download e' gia' in corso, ignora
@@ -2486,12 +2867,14 @@ class MainWindow(QMainWindow):
         self.organize_tab = OrganizeTab()
         self.swap_tab = SwapTab()
         self.multi_swap_tab = MultiSwapTab()
+        self.folder_rename_tab = FolderRenameTab()
         self.history_tab = HistoryTab()
         self.settings_tab = SettingsTab()
 
         self.tabs.addTab(self.organize_tab, "Organizza")
         self.tabs.addTab(self.swap_tab, "Swap")
         self.tabs.addTab(self.multi_swap_tab, "Swap multiplo")
+        self.tabs.addTab(self.folder_rename_tab, "Rinomina cartelle")
         self.tabs.addTab(self.history_tab, "Cronologia")
         self.tabs.addTab(self.settings_tab, "Impostazioni")
         main_layout.addWidget(self.tabs)
@@ -2500,6 +2883,7 @@ class MainWindow(QMainWindow):
         self.organize_tab.operation_completed.connect(self.history_tab.add_entry)
         self.swap_tab.operation_completed.connect(self.history_tab.add_entry)
         self.multi_swap_tab.operation_completed.connect(self.history_tab.add_entry)
+        self.folder_rename_tab.operation_completed.connect(self.history_tab.add_entry)
 
         self._apply_theme()
 
@@ -2525,6 +2909,8 @@ class MainWindow(QMainWindow):
             self.swap_tab._exec_worker,
             self.multi_swap_tab._worker,
             self.multi_swap_tab._exec_worker,
+            self.folder_rename_tab._worker,
+            self.folder_rename_tab._exec_worker,
             self.settings_tab._download_worker,
         ]
         return [worker for worker in workers if worker is not None and worker.isRunning()]

@@ -5,7 +5,7 @@ Espone due logger:
   - get_app_logger(): eventi generali (download, classificazioni, errori, etc.)
                      scrive su %LOCALAPPDATA%/AgentOrdinatore/logs/app.log
                      con rotazione automatica (max 5 file da 1 MB ciascuno).
-  - get_moves_logger(): solo spostamenti/copie file, formato leggibile,
+  - get_moves_logger(): spostamenti/copie file e rinomine cartelle, formato leggibile,
                         scrive su %LOCALAPPDATA%/AgentOrdinatore/logs/moves.log
                         senza rotazione (cronologia completa).
 
@@ -15,6 +15,7 @@ Uso tipico:
     log.info("Download avviato per tier=%s", tier)
     moves = get_moves_logger()
     moves.info("MOVE | %s -> %s", source, dest)
+    moves.info("RENAME_FOLDER | %s -> %s", source, dest)
 """
 
 import logging

@@ -18,6 +18,7 @@ _DEFAULTS = {
     "selected_tier": "standard",
     "auto_detect": True,
     "gpu_offload": True,
+    "allow_folder_rename": False,
     "theme": "dark",
 }
 
@@ -102,4 +103,14 @@ def get_theme() -> str:
 def set_theme(theme: str):
     config = load_config()
     config["theme"] = theme
+    save_config(config)
+
+
+def is_folder_rename_allowed() -> bool:
+    return bool(load_config().get("allow_folder_rename", False))
+
+
+def set_folder_rename_allowed(enabled: bool):
+    config = load_config()
+    config["allow_folder_rename"] = bool(enabled)
     save_config(config)

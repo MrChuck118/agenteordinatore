@@ -9,7 +9,7 @@ import re
 import subprocess
 
 from model_manager import MODELS, get_model_path
-from utils import format_size, sanitize_category
+from utils import format_size, sanitize_category, sanitize_folder_name
 from logger import get_app_logger
 
 _log = get_app_logger()
@@ -91,6 +91,40 @@ File: "report_Q3.xlsx" (145 KB)
 1: Lavoro (D:/docs/Lavoro) -> [budget.xlsx, contratto.pdf]
 2: Backup (E:/backup) -> [archive.tar.gz, dump.sql]
 -> 1"""
+
+FOLDER_RENAME_SYSTEM_PROMPT = """You suggest whether a folder should keep its current name or be renamed based on its file names.
+Respond ONLY with valid JSON, no other text.
+
+Rules:
+- Output format: {"action":"keep|rename","suggested_name":"Single Folder Name","confidence":0.0,"reason":"short reason"}
+- The suggested_name must be a single folder name, not a path.
+- Do not suggest renaming project folders or intentional names unless the content is clearly different.
+- If the current name is coherent with the contents, use action "keep".
+- If the current name is generic/confusing and contents are homogeneous, use action "rename".
+- Prefer concise Italian names when file names look Italian, otherwise concise English names.
+- Never use reserved Windows names, slashes, drive letters, or punctuation-heavy names.
+
+Examples:
+Current folder: "Video"
+Weak name: false
+Project markers: []
+Extensions: {".mp4": 12, ".mkv": 3}
+Files: [vacanza.mp4, compleanno.mkv, clip.mov]
+-> {"action":"keep","suggested_name":"Video","confidence":0.92,"reason":"Il nome attuale e' coerente con file video."}
+
+Current folder: "Nuova cartella (2)"
+Weak name: true
+Project markers: []
+Extensions: {".pdf": 9, ".docx": 2}
+Files: [fattura_aprile.pdf, bolletta_luce.pdf, contratto_affitto.docx]
+-> {"action":"rename","suggested_name":"Amministrazione","confidence":0.86,"reason":"Contiene soprattutto documenti amministrativi."}
+
+Current folder: "Progetto Cliente X"
+Weak name: false
+Project markers: ["pyproject.toml", ".git"]
+Extensions: {".py": 12, ".md": 2}
+Files: [main.py, README.md, pyproject.toml]
+-> {"action":"keep","suggested_name":"Progetto Cliente X","confidence":0.95,"reason":"Sembra un progetto intenzionale."}"""
 
 
 # ── Classificatore locale ───────────────────────────────────────────
@@ -307,6 +341,53 @@ class LocalClassifier:
 
         _log.warning("Parsing indice fallito - fallback a 0. Risposta modello: %r", text[:200])
         return 0
+
+    @staticmethod
+    def _parse_folder_rename(response_text: str, current_name: str) -> dict:
+        """Estrae una proposta rename cartella da JSON, con fallback keep."""
+        text = response_text.strip()
+        data = None
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            json_match = re.search(r"\{[^}]+\}", text)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    data = None
+
+        if not isinstance(data, dict):
+            _log.warning("Parsing rename cartella fallito, fallback keep. Risposta: %r", text[:200])
+            return {
+                "action": "keep",
+                "suggested_name": current_name,
+                "confidence": 0.0,
+                "reason": "Risposta modello non valida.",
+            }
+
+        action = str(data.get("action", "keep")).strip().lower()
+        if action not in {"keep", "rename"}:
+            action = "keep"
+
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        suggested = sanitize_folder_name(data.get("suggested_name") or current_name, fallback=current_name)
+        reason = str(data.get("reason") or "").strip()
+        if not reason:
+            reason = "Nessuna motivazione fornita."
+
+        return {
+            "action": action,
+            "suggested_name": suggested,
+            "confidence": confidence,
+            "reason": reason[:240],
+        }
 
     def classify_file(self, filename: str, file_size) -> str:
         """Classifica un file e ritorna la categoria."""
@@ -535,6 +616,81 @@ class LocalClassifier:
         )
         return final_idx
 
+    def suggest_folder_rename(self, profile: dict) -> dict:
+        """
+        Suggerisce se rinominare una cartella in base al profilo contenuti.
+
+        Ritorna un dict con action, suggested_name, confidence e reason.
+        Le cartelle protette da marker progetto vengono preservate localmente.
+        """
+        current_name = str(profile.get("current_name") or "Cartella")
+        if profile.get("protected"):
+            markers = ", ".join(profile.get("project_markers") or [])
+            return {
+                "action": "keep",
+                "suggested_name": current_name,
+                "confidence": 1.0,
+                "reason": f"Cartella protetta: marker progetto rilevati ({markers}).",
+            }
+
+        if int(profile.get("file_count") or 0) == 0:
+            return {
+                "action": "keep",
+                "suggested_name": current_name,
+                "confidence": 1.0,
+                "reason": "Cartella vuota: rinomina non proposta.",
+            }
+
+        self._ensure_loaded()
+
+        extensions = profile.get("extensions") or {}
+        files = profile.get("sample_files") or []
+        marker_text = ", ".join(profile.get("project_markers") or [])
+        extensions_text = json.dumps(extensions, ensure_ascii=False)
+        files_text = ", ".join(files)
+        user_message = (
+            f'Current folder: "{current_name}"\n'
+            f"Weak name: {bool(profile.get('weak_name'))}\n"
+            f"Project markers: [{marker_text}]\n"
+            f"File count: {profile.get('file_count', 0)}\n"
+            f"Total size: {profile.get('total_size_str', '')}\n"
+            f"Extensions: {extensions_text}\n"
+            f"Files: [{files_text}]"
+        )
+
+        response = self.model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": FOLDER_RENAME_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=160,
+            temperature=0.1,
+            stop=["\n\n"],
+        )
+
+        result_text = response["choices"][0]["message"]["content"]
+        result = self._parse_folder_rename(result_text, current_name)
+
+        suggested = sanitize_folder_name(result["suggested_name"], fallback=current_name)
+        result["suggested_name"] = suggested
+
+        same_name = suggested.lower() == current_name.lower()
+        threshold = 0.65 if profile.get("weak_name") else 0.88
+        if result["action"] == "rename" and (same_name or result["confidence"] < threshold):
+            result["action"] = "keep"
+            if same_name:
+                result["reason"] = "Il nome suggerito coincide con quello attuale."
+            else:
+                result["reason"] = (
+                    f"Confidenza {result['confidence']:.2f} sotto soglia {threshold:.2f}."
+                )
+
+        _log.debug(
+            "suggest_folder_rename: %s -> %s %s %.2f",
+            current_name, result["action"], result["suggested_name"], result["confidence"],
+        )
+        return result
+
 
 # ── Istanza globale e interfaccia pubblica ──────────────────────────
 
@@ -593,6 +749,15 @@ def classify_for_multi_swap(
     return _classifier.classify_for_multi_swap(
         filename, file_size, folder_specs, target_path=target_path,
     )
+
+
+def suggest_folder_rename(profile: dict) -> dict:
+    """Wrapper modulo: suggerisce se rinominare una cartella."""
+    global _classifier
+    if _classifier is None:
+        from config import get_selected_tier
+        init_classifier(get_selected_tier())
+    return _classifier.suggest_folder_rename(profile)
 
 
 def unload_model():

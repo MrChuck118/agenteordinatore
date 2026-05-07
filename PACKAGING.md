@@ -10,7 +10,7 @@ Questo progetto supporta una distribuzione Windows in 3 livelli:
 
 - Windows 10 o 11.
 - Python compatibile installato sul PC di build.
-- Ambiente `.venv` valido creato con `install.bat`.
+- Dipendenze installate nel Python utente con `install.bat` senza `.venv`.
 - Connessione Internet al primo build per installare `pyinstaller`.
 - Inno Setup 6 solo se vuoi creare anche l'installer `.exe`.
 
@@ -73,5 +73,5 @@ Questo evita pacchetti enormi e permette di scaricare solo il tier scelto dall'u
 ## Note
 
 - Usa PyInstaller in modalita' `onedir`, non `onefile`, per ridurre falsi positivi antivirus e tempi di avvio.
-- Non distribuire `.venv`, `history.json`, log, cache HuggingFace o modelli scaricati.
+- Non distribuire `history.json`, log, cache HuggingFace o modelli scaricati.
 - Per un rilascio pubblico conviene firmare sia `Agent Ordinatore.exe` sia l'installer.

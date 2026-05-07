@@ -8,29 +8,51 @@ echo ============================================================
 echo.
 
 set APP_NAME=Agent Ordinatore
-set PYTHON_EXE=.venv\Scripts\python.exe
 set DIST_DIR=dist\%APP_NAME%
 set EXE_PATH=%DIST_DIR%\%APP_NAME%.exe
+set PYTHON_EXE=
 
-if not exist "%PYTHON_EXE%" (
-    echo  [ERRORE] Ambiente virtuale non trovato.
-    echo          Esegui prima install.bat, poi rilancia questo script.
+rem Cerca prima installazioni Python utente comuni, poi PATH/launcher.
+for %%V in (313 312 311 310) do (
+    if not defined PYTHON_EXE (
+        if exist "%LocalAppData%\Programs\Python\Python%%V\python.exe" (
+            set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python%%V\python.exe"
+        )
+    )
+)
+
+if not defined PYTHON_EXE (
+    for %%P in (python py) do (
+        if not defined PYTHON_EXE (
+            %%P --version >nul 2>&1
+            if not errorlevel 1 set "PYTHON_EXE=%%P"
+        )
+    )
+)
+
+if not defined PYTHON_EXE (
+    echo  [ERRORE] Python non trovato.
+    echo          Installa Python 3.10+ o esegui install.bat.
     echo.
     if not defined NO_PAUSE pause
     exit /b 1
 )
 
-"%PYTHON_EXE%" -c "import sys; sys.exit(0)" >nul 2>&1
+echo  Python:
+echo    %PYTHON_EXE%
+echo.
+
+"%PYTHON_EXE%" -c "import PySide6, llama_cpp" >nul 2>&1
 if errorlevel 1 (
-    echo  [ERRORE] La .venv esistente non e' valida o non e' portabile.
-    echo          Esegui install.bat: ora ricrea automaticamente la .venv rotta.
+    echo  [ERRORE] Dipendenze runtime mancanti.
+    echo          Esegui install.bat, poi rilancia build_exe.bat.
     echo.
     if not defined NO_PAUSE pause
     exit /b 1
 )
 
 echo [1/4] Installazione strumenti di build...
-"%PYTHON_EXE%" -m pip install -r build_requirements.txt --quiet --no-warn-script-location
+"%PYTHON_EXE%" -m pip install --user -r build_requirements.txt --quiet --no-warn-script-location
 if errorlevel 1 (
     echo.
     echo  [ERRORE] Impossibile installare PyInstaller.

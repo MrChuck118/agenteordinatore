@@ -40,9 +40,8 @@ crea_zip_distribuzione.bat
 install.bat
 ```
 
-Nota importante: la `.venv` presente nella cartella attuale era non portabile/rotta.
-`install.bat` e' stato corretto: ora controlla se la `.venv` funziona e, se non funziona,
-la elimina e la ricrea.
+Nota importante: il progetto non richiede piu' `.venv`. `install.bat` usa il
+Python utente installato sul sistema e installa le dipendenze con `pip --user`.
 
 ## Prerequisiti sul PC di casa
 
@@ -71,7 +70,7 @@ C:\Users\user\Desktop\ultimate version\Agente Ordinatore
 Su un altro PC il path puo' essere diverso. L'importante e' entrare nella cartella
 dove si trovano `install.bat`, `gui.py`, `main.py`, `build_exe.bat`.
 
-## Passo 2 - Ricrea o aggiorna l'ambiente Python
+## Passo 2 - Installa o aggiorna le dipendenze Python
 
 Esegui:
 
@@ -82,13 +81,12 @@ install.bat
 Cosa fa:
 
 - verifica Python;
-- crea `.venv` se manca;
-- se `.venv` esiste ma e' rotta/non portabile, la elimina e la ricrea;
-- installa dipendenze base;
-- installa `llama-cpp-python` CPU o CUDA, in base al PC.
+- installa dipendenze base nel Python utente;
+- installa `llama-cpp-python` CPU o CUDA, in base al PC;
+- non crea e non richiede `.venv`.
 
-Se questo step fallisce, risolvere prima questo. Senza `.venv` valida non puoi fare
-ne' build portable ne' installer.
+Se questo step fallisce, risolvere prima questo. Senza dipendenze runtime valide
+non puoi fare ne' build portable ne' installer.
 
 ## Passo 3 - Crea la cartella portable con EXE
 
@@ -214,7 +212,6 @@ installer\Output\AgentOrdinatore_Setup_1.0.0.exe
 Non distribuire:
 
 ```text
-.venv\
 build\
 history.json
 *.log
@@ -226,7 +223,7 @@ models\
 
 ## Problemi comuni
 
-### build_exe.bat dice che la venv non e' valida
+### build_exe.bat dice che mancano dipendenze runtime
 
 Esegui:
 
@@ -301,4 +298,4 @@ Ultimo stato verificato:
 - sintassi Python e `.spec` compilano;
 - `build_exe.bat` e' pronto;
 - `build_installer.bat` e' pronto;
-- su questo PC la `.venv` era rotta, quindi prima serve eseguire `install.bat`.
+- il flusso corrente usa Python utente senza `.venv`.

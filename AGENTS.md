@@ -26,8 +26,8 @@ Per lavorare sul sorgente:
 install.bat
 ```
 
-Questo crea `.venv`, installa le dipendenze e installa `llama-cpp-python` da
-wheel precompilata. Python consigliato: 3.10, 3.11 o 3.12.
+Questo installa le dipendenze nel Python utente, senza `.venv`, e installa
+`llama-cpp-python` da wheel precompilata. Python consigliato: 3.10, 3.11 o 3.12.
 
 Avvio app da sorgente:
 
@@ -150,11 +150,11 @@ Packaging:
 
 ## Check consigliati prima di commit/push
 
-Se `.venv` esiste:
+Se Python e' disponibile:
 
 ```powershell
-.venv\Scripts\python.exe -m py_compile brain.py gui.py main.py model_manager.py hardware.py config.py logger.py utils.py
-.venv\Scripts\python.exe main.py --help
+python -m py_compile brain.py gui.py main.py model_manager.py hardware.py config.py logger.py utils.py
+python main.py --help
 ```
 
 Se hai cambiato packaging:

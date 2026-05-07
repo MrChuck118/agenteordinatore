@@ -6,11 +6,12 @@
 
 Il progetto usa esclusivamente **modelli LLM locali** tramite `llama-cpp-python` e pesi GGUF della famiglia **Qwen3.5**. I file analizzati non vengono inviati a servizi esterni: l'applicazione funziona offline dopo il download iniziale del modello da HuggingFace. Il vecchio supporto cloud/API Anthropic e' stato rimosso dal codice sorgente operativo.
 
-Le tre modalita' principali sono:
+Le quattro modalita' principali sono:
 
 - **Organizza**: analizza i file presenti in una singola directory e li classifica in sottocartelle logiche, ad esempio `Documenti/PDF`, `Immagini/Foto`, `Codice/Python`.
 - **Swap**: confronta due directory e individua i file fuori posto, proponendo lo spostamento o la copia nella cartella piu' coerente.
 - **Swap multiplo**: confronta due o piu' directory e sceglie per ogni file la cartella piu' coerente tra tutte, usando un torneo a chunk calibrato sul tier del modello.
+- **Rinomina cartelle**: analizza cartelle esistenti in base ai file contenuti e propone nuovi nomi prudenti, con opzione globale e conferma selettiva.
 
 L'applicazione e' sviluppata in Python, con UI desktop basata su **PySide6**, inferenza locale tramite **llama-cpp-python**, download modelli tramite **huggingface_hub** e storage dati utente in `%LOCALAPPDATA%\AgentOrdinatore`.
 
@@ -24,8 +25,8 @@ Agente Ordinatore/
 |-- .vscode/                    # Impostazioni locali di Visual Studio Code
 |-- installer/
 |   `-- AgentOrdinatore.iss     # Script Inno Setup per creare l'installer Windows
-|-- .gitignore                  # Esclude venv, build, dist, cache, log, modelli e dati personali
-|-- Agent Ordinatore.bat        # Launcher Windows della GUI tramite pythonw.exe
+|-- .gitignore                  # Esclude venv legacy, build, dist, cache, log, modelli e dati personali
+|-- Agent Ordinatore.bat        # Launcher Windows: apre l'EXE se esiste, altrimenti gui.py con pythonw
 |-- AgentOrdinatore.spec        # Configurazione PyInstaller per build onedir della GUI
 |-- avvia_debug.bat             # Launcher debug con console visibile
 |-- brain.py                    # Core AI locale: caricamento modello, prompt, parsing risposte e classificazione
@@ -37,19 +38,21 @@ Agente Ordinatore/
 |-- crea_collegamento.ps1       # Script PowerShell per creare collegamenti Windows
 |-- crea_zip_distribuzione.bat  # Crea uno ZIP distribuibile del progetto/build
 |-- generate_icon.py            # Generatore icone tramite Pillow
-|-- gui.py                      # Interfaccia grafica PySide6 con tab Organizza, Swap, Cronologia e Impostazioni
+|-- gui.py                      # Interfaccia grafica PySide6 con tab Organizza, Swap, Rename, Cronologia e Impostazioni
 |-- GUIDA_BUILD_WINDOWS.md      # Guida operativa completa per build EXE/installer su Windows
 |-- hardware.py                 # Rilevamento CPU/RAM/GPU/VRAM e suggerimento tier modello
 |-- history.json                # Cronologia legacy/fallback; la GUI salva in %LOCALAPPDATA%
 |-- icon.ico / icon.png         # Asset icona applicazione
-|-- install.bat                 # Setup ambiente Python e installazione llama-cpp-python CPU/CUDA
+|-- install.bat                 # Setup dipendenze su Python utente e installazione llama-cpp-python CPU/CUDA
 |-- logger.py                   # Logging centralizzato app.log, moves.log e cartella logs
-|-- main.py                     # CLI: organize, swap e setup modelli
+|-- main.py                     # CLI: organize, swap, multiswap, rename-folders e setup modelli
 |-- model_manager.py            # Gestione download/eliminazione modelli GGUF in %LOCALAPPDATA%
 |-- PACKAGING.md                # Note sintetiche su packaging portable, installer e modelli esterni
 |-- README.md                   # Documentazione utente principale
 |-- requirements.txt            # Dipendenze runtime Python, escluso llama-cpp-python
 |-- schema progetto.md          # Questo documento
+|-- SPEC_RENAME_FOLDERS_V1.md   # Spec prudente per rinomina cartelle esistenti
+|-- SPEC_RENAME_FOLDERS_V2.md   # Spec futura per normalizzazione semantica cartelle
 `-- utils.py                    # Scansione file, sanitizzazione categorie, move/copy sicuri e formattazione size
 ```
 
@@ -66,8 +69,8 @@ Note sulla struttura:
 ### 1. Interazione utente
 
 - **`gui.py`** implementa la GUI desktop con PySide6.
-  - Tab principali: Organizza, Swap, Swap multiplo, Cronologia, Impostazioni.
-  - Usa worker `QThread` dedicati: `OrganizeAnalyzeWorker`, `OrganizeExecuteWorker`, `SwapAnalyzeWorker`, `SwapExecuteWorker`, `MultiSwapAnalyzeWorker`, `MultiSwapExecuteWorker`, `ModelDownloadWorker`.
+  - Tab principali: Organizza, Swap, Swap multiplo, Rinomina cartelle, Cronologia, Impostazioni.
+  - Usa worker `QThread` dedicati: `OrganizeAnalyzeWorker`, `OrganizeExecuteWorker`, `SwapAnalyzeWorker`, `SwapExecuteWorker`, `MultiSwapAnalyzeWorker`, `MultiSwapExecuteWorker`, `FolderRenameAnalyzeWorker`, `FolderRenameExecuteWorker`, `ModelDownloadWorker`.
   - Usa `Signal` Qt per aggiornare tabelle, progress bar e stato senza bloccare l'interfaccia.
   - Protegge da avvii multipli dello stesso worker e disabilita i pulsanti durante analisi/esecuzione.
   - Supporta anteprima, selezione file tramite checkbox, esecuzione reale, copia invece di spostamento e cronologia operazioni.
@@ -76,7 +79,7 @@ Note sulla struttura:
   - All'avvio apre il tab Impostazioni se nessun modello e' scaricato.
 
 - **`main.py`** implementa la CLI.
-  - Comandi disponibili: `organize`, `swap`, `multiswap`, `setup`.
+  - Comandi disponibili: `organize`, `swap`, `multiswap`, `rename-folders`, `setup`.
   - Modalita' dry-run di default, con `--execute` per applicare le modifiche.
   - Opzione `--copy` per copiare invece di spostare.
   - Opzione `--tier` per scegliere il modello da CLI.
@@ -98,7 +101,7 @@ Le preferenze e i dati generati dall'app sono salvati fuori dal workspace:
 ```
 
 - **`config.py`**
-  - Gestisce `selected_tier`, `theme`, `auto_detect` e `gpu_offload`.
+  - Gestisce `selected_tier`, `theme`, `auto_detect`, `gpu_offload` e `allow_folder_rename`.
   - Migra eventuale vecchio `settings.json` dal progetto.
   - Scrive su disco solo quando serve aggiungere default, migrare o salvare modifiche.
 
@@ -116,6 +119,7 @@ Le preferenze e i dati generati dall'app sono salvati fuori dal workspace:
     - `CLASSIFY_SYSTEM_PROMPT` per categorizzare un file.
     - `SWAP_SYSTEM_PROMPT` per scegliere se un file appartiene alla cartella A o B.
     - `MULTI_SWAP_SYSTEM_PROMPT` per scegliere una cartella vincitrice tra N candidate tramite indice numerico.
+    - `FOLDER_RENAME_SYSTEM_PROMPT` per decidere se mantenere o rinominare una cartella in base al profilo dei file.
   - Definisce `TIER_STRATEGY` con `chunk_size`, `n_ctx` e `sample_files` per adattare contesto e torneo al tier scelto.
   - Per lo Swap multiplo usa `classify_for_multi_swap()`: se le cartelle candidate superano `chunk_size`, divide le opzioni in chunk, seleziona vincitori locali e ricorre fino a un solo vincitore.
   - Nei sample di Swap e Swap multiplo il file target viene escluso dalla cartella di origine per path completo, evitando bias verso "resta dove si trova".
@@ -124,6 +128,7 @@ Le preferenze e i dati generati dall'app sono salvati fuori dal workspace:
     - JSON contenuto in testo sporco.
     - Regex sul campo `category`.
     - parsing numerico con range check per le risposte multi-swap.
+    - parsing JSON per le proposte di rinomina cartelle.
     - fallback sicuro.
   - Usa `sanitize_category()` da `utils.py` per trasformare l'output AI in path relativo sicuro.
   - Gestisce GPU offload in base alla VRAM disponibile e all'opzione `gpu_offload`.
@@ -141,8 +146,10 @@ Le preferenze e i dati generati dall'app sono salvati fuori dal workspace:
     - evita nomi riservati come `CON`, `PRN`, `AUX`, `NUL`, `COM1`, `LPT1`;
     - limita la profondita' a 2 livelli;
     - restituisce sempre un path relativo.
+  - `build_folder_profile()` crea un profilo leggero di una cartella usando nomi file, estensioni, dimensioni e marker progetto.
+  - `rename_folder_safe()` rinomina cartelle nella stessa cartella padre, sanitizza il nome e risolve conflitti senza sovrascrivere.
   - `move_file()` e `copy_file()` creano la destinazione se serve e gestiscono conflitti aggiungendo timestamp con microsecondi.
-  - Ogni move/copy reale viene registrato in `moves.log`.
+  - Ogni move/copy/rename reale viene registrato in `moves.log`.
 
 ### 5. Hardware e scelta modello
 
@@ -164,7 +171,7 @@ Tier attuali:
 
 - **`logger.py`**
   - `get_app_logger()` scrive eventi generali su `app.log` con rotazione `5 x 1 MB`.
-  - `get_moves_logger()` scrive la cronologia completa di move/copy su `moves.log`, senza rotazione.
+  - `get_moves_logger()` scrive la cronologia completa di move/copy/rename su `moves.log`, senza rotazione.
   - `get_logs_dir()` fornisce alla GUI la cartella log.
   - `set_debug_mode(bool)` abilita/disabilita logging DEBUG sull'app logger.
   - Lo Swap multiplo logga in `app.log` avvio/fine analisi, strategia tier, fallback `n_ctx`, parsing fuori range, avvio/fine esecuzione e dettagli torneo a livello DEBUG. Gli spostamenti reali continuano a finire in `moves.log` tramite `move_file()`/`copy_file()`.
@@ -173,7 +180,7 @@ Formato principale:
 
 ```text
 timestamp | livello | logger | messaggio
-timestamp | MOVE|COPY | source -> destination
+timestamp | MOVE|COPY|RENAME_FOLDER | source -> destination
 ```
 
 ---
@@ -192,7 +199,7 @@ Il progetto ora include una pipeline Windows dedicata.
   - Esclude pacchetti non usati come `anthropic`, `jupyter`, `matplotlib`, `pytest`, `tkinter`.
 
 - **`build_exe.bat`**
-  - Usa `.venv`.
+  - Usa il Python utente rilevato automaticamente, senza `.venv`.
   - Installa strumenti da `build_requirements.txt`.
   - Produce:
 
@@ -235,7 +242,7 @@ dist\
   - `PySide6`
   - `Pillow`
 
-- **`llama-cpp-python`** non e' in `requirements.txt`: viene installato da `install.bat` con wheel precompilata CPU o CUDA.
+- **`llama-cpp-python`** non e' in `requirements.txt`: viene installato da `install.bat` sul Python utente con wheel precompilata CPU o CUDA.
 - **`build_requirements.txt`** contiene solo dipendenze di build:
   - `pyinstaller`
   - `pyinstaller-hooks-contrib`
@@ -246,13 +253,13 @@ dist\
 
 | File | Responsabilita' |
 | --- | --- |
-| `gui.py` | UI desktop, worker thread, cronologia, impostazioni, download modelli, tema, log folder |
-| `main.py` | CLI e orchestrazione comandi `organize`, `swap`, `multiswap`, `setup` |
-| `brain.py` | Inferenza locale, prompt, parsing output modello, torneo multi-swap, gestione istanza classificatore |
+| `gui.py` | UI desktop, worker thread, cronologia, impostazioni, download modelli, tema, log folder, preview rename cartelle |
+| `main.py` | CLI e orchestrazione comandi `organize`, `swap`, `multiswap`, `rename-folders`, `setup` |
+| `brain.py` | Inferenza locale, prompt, parsing output modello, torneo multi-swap, suggerimento nomi cartelle, gestione istanza classificatore |
 | `model_manager.py` | Catalogo tier, path modelli, download HuggingFace, delete/list modelli |
 | `hardware.py` | Rilevamento hardware e suggerimento tier |
-| `config.py` | Preferenze utente e migrazione vecchie impostazioni |
-| `utils.py` | Operazioni filesystem sicure, sanitizzazione categorie, move/copy, size formatting |
+| `config.py` | Preferenze utente, flag rinomina cartelle e migrazione vecchie impostazioni |
+| `utils.py` | Operazioni filesystem sicure, sanitizzazione categorie/nomi cartella, move/copy/rename, size formatting |
 | `logger.py` | Logger applicazione, logger spostamenti, cartella log e debug mode |
 | `generate_icon.py` | Generazione asset icona |
 | `AgentOrdinatore.spec` | Configurazione build PyInstaller |
@@ -265,9 +272,9 @@ dist\
 Lo schema e' aggiornato alla struttura corrente del progetto:
 
 - AI solo locale tramite GGUF e `llama-cpp-python`.
-- GUI PySide6 con tab Organizza, Swap, Swap multiplo, Cronologia e Impostazioni.
-- CLI completa con dry-run, execute, copy, tier, multiswap e setup modelli.
+- GUI PySide6 con tab Organizza, Swap, Swap multiplo, Rinomina cartelle, Cronologia e Impostazioni.
+- CLI completa con dry-run, execute, copy, tier, multiswap, rename-folders e setup modelli.
 - Storage modelli/config/log in `%LOCALAPPDATA%\AgentOrdinatore`.
-- Logging centralizzato con `app.log`, `moves.log`, `libs.log`.
+- Logging centralizzato con `app.log`, `moves.log`, `libs.log`; le rinomine cartelle sono tracciate come `RENAME_FOLDER`.
 - Sanitizzazione robusta delle categorie AI prima di creare path.
 - Pipeline Windows per build portable, installer Inno Setup e ZIP distribuzione.
