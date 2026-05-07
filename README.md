@@ -39,16 +39,19 @@ L'app ha quattro modalita' principali:
 - **Organizza**: scegli una cartella disordinata, l'AI classifica i file
   in sottocartelle (es. `Immagini/Foto`, `Documenti/PDF`, `Codice/Python`, …)
 - **Swap**: scegli due cartelle, l'AI sposta i file fuori posto da una all'altra
-  in base al loro "tema"
+  in base al loro "tema"; opzionalmente puo' proporre anche la rinomina finale
+  delle due cartelle
 - **Swap multiplo**: scegli due o piu' cartelle, l'AI sceglie per ogni file
-  la cartella piu' coerente tra tutte usando un torneo a chunk calibrato sul tier
+  la cartella piu' coerente tra tutte usando un torneo a chunk calibrato sul tier;
+  opzionalmente puo' proporre la rinomina delle cartelle dopo lo scambio
 - **Rinomina cartelle**: analizza le sottocartelle immediate di una cartella madre
   e propone nomi piu' coerenti in base ai file contenuti, con conferma selettiva
 
 Le modalita' operative hanno **anteprima** (puoi vedere dove verranno spostati i file
 o rinominate le cartelle prima di confermare) e opzione **Copia** invece di Sposta
 dove applicabile. La rinomina cartelle e' disattivata di default: abilitala in
-**Impostazioni -> Rinomina cartelle**.
+**Impostazioni -> Rinomina cartelle**. In Swap e Swap multiplo resta comunque
+una scelta per singola operazione tramite **Proponi rinomina cartelle**.
 
 ## Cronologia e Log
 
@@ -74,8 +77,10 @@ Per chi preferisce la riga di comando:
 python main.py organize "C:\Downloads"            :: dry-run
 python main.py organize "C:\Downloads" --execute  :: esegui
 python main.py swap "C:\A" "C:\B" --execute
+python main.py swap "C:\A" "C:\B" --rename-folders
 python main.py multiswap "C:\A" "C:\B" "C:\C"     :: dry-run
 python main.py multiswap "C:\A" "C:\B" "C:\C" --copy --execute
+python main.py multiswap "C:\A" "C:\B" "C:\C" --rename-folders
 python main.py rename-folders "C:\Archivio"       :: dry-run
 python main.py rename-folders "C:\Archivio" --execute
 python main.py setup --list

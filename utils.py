@@ -207,6 +207,53 @@ def build_folder_profile(folder: Path, sample_limit: int = 30) -> dict:
     }
 
 
+def build_folder_profile_from_names(
+    folder: Path,
+    file_names: list[str],
+    sample_limit: int = 30,
+) -> dict:
+    """
+    Costruisce un profilo cartella partendo da una lista di nomi file prevista.
+
+    Serve per valutare un eventuale nuovo nome dopo uno swap, prima che tutte le
+    operazioni siano gia' state applicate sul disco.
+    """
+    clean_names = [
+        str(name)
+        for name in file_names
+        if str(name).strip() and not Path(str(name)).name.startswith(".")
+    ]
+    extension_counts: dict[str, int] = {}
+    sample_files: list[str] = []
+
+    for name in clean_names:
+        path = Path(name)
+        ext = path.suffix.lower() or "[senza estensione]"
+        extension_counts[ext] = extension_counts.get(ext, 0) + 1
+        if len(sample_files) < sample_limit:
+            sample_files.append(path.name)
+
+    top_extensions = sorted(
+        extension_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:10]
+
+    markers = detect_project_markers(folder)
+    return {
+        "path": str(folder),
+        "current_name": folder.name,
+        "file_count": len(clean_names),
+        "total_size": 0,
+        "total_size_str": "n/d",
+        "sample_files": sample_files,
+        "extensions": dict(top_extensions),
+        "weak_name": is_generic_folder_name(folder.name),
+        "project_markers": markers,
+        "protected": bool(markers),
+        "projected": True,
+    }
+
+
 def ensure_folder(folder: Path) -> Path:
     """
     Crea una cartella (e tutte le cartelle intermedie) se non esiste già.

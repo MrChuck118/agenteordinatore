@@ -8,8 +8,10 @@ Uso:
   python main.py organize <cartella> --tier pro                       # Usa modello Pro
   python main.py swap <cartella_a> <cartella_b>                       # Dry run swap binario
   python main.py swap <cartella_a> <cartella_b> --execute             # Esecuzione reale swap binario
+  python main.py swap <cartella_a> <cartella_b> --rename-folders       # Include proposta rinomina cartelle
   python main.py multiswap <c1> <c2> [<c3> ...]                       # Dry run multi-swap
   python main.py multiswap <c1> <c2> <c3> --execute                   # Esecuzione reale multi-swap
+  python main.py multiswap <c1> <c2> --rename-folders                 # Include proposta rinomina cartelle
   python main.py setup                                                # Mostra hardware e modelli
   python main.py setup --download standard                            # Scarica modello standard
   python main.py setup --list                                         # Lista modelli scaricati
@@ -23,7 +25,7 @@ from pathlib import Path
 
 from utils import (
     scan_folder, move_file, copy_file, format_size, sanitize_category,
-    build_folder_profile, rename_folder_safe,
+    build_folder_profile, build_folder_profile_from_names, rename_folder_safe,
 )
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
@@ -78,6 +80,70 @@ def _build_folder_specs(
             "files": names,
         })
     return specs
+
+
+def _remove_one_name(names: list[str], target: str):
+    try:
+        names.pop(names.index(target))
+    except ValueError:
+        pass
+
+
+def _handle_projected_folder_renames(
+    folders: list[Path],
+    projected_names: list[list[str]],
+    dry_run: bool,
+) -> list[dict]:
+    """Propone/applica rinomine cartella basate sul contenuto finale previsto."""
+    if not is_folder_rename_allowed():
+        print("\n  Rinomina cartelle richiesta ma disabilitata nelle Impostazioni.")
+        return []
+
+    print("\n  Analisi nomi cartelle post-swap:")
+    suggestions: list[dict] = []
+    for folder, names in zip(folders, projected_names):
+        profile = build_folder_profile_from_names(folder, names)
+        suggestion = suggest_folder_rename(profile)
+        item = {
+            "path": str(folder),
+            "current_name": folder.name,
+            "suggested_name": suggestion["suggested_name"],
+            "confidence": float(suggestion["confidence"]),
+            "action": suggestion["action"],
+            "reason": suggestion["reason"],
+            "file_count": profile["file_count"],
+        }
+        suggestions.append(item)
+        decision = "RINOMINA" if item["action"] == "rename" else "mantieni"
+        print(
+            f"    - {folder.name}: {decision} -> {item['suggested_name']} "
+            f"({item['confidence']:.2f})"
+        )
+        print(f"      motivo: {item['reason']}")
+
+    candidates = [item for item in suggestions if item["action"] == "rename"]
+    if dry_run or not candidates:
+        if dry_run and candidates:
+            print("  [DRY RUN] Nessuna cartella e' stata rinominata.")
+        return []
+
+    successful: list[dict] = []
+    ordered = sorted(
+        candidates,
+        key=lambda item: len(Path(item["path"]).parts),
+        reverse=True,
+    )
+    for item in ordered:
+        try:
+            final = rename_folder_safe(Path(item["path"]), item["suggested_name"])
+            item["final_name"] = final.name
+            item["final_path"] = str(final)
+            successful.append(item)
+            print(f"    [RENAME] {item['current_name']} -> {final.name}")
+        except Exception as exc:
+            log.exception("CLI: rinomina cartella post-swap fallita per %s", item["path"])
+            print(f"    [ERRORE] {item['current_name']}: {exc}")
+    return successful
 
 
 def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) -> None:
@@ -152,7 +218,13 @@ def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) 
     print(f"{'=' * 60}\n")
 
 
-def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = False) -> None:
+def swap(
+    folder_a: Path,
+    folder_b: Path,
+    dry_run: bool = True,
+    use_copy: bool = False,
+    rename_after: bool = False,
+) -> None:
     """
     Analizza il contenuto di due cartelle e sposta/copia i file fuori posto
     nella cartella giusta in base alla "vocazione" di ciascuna.
@@ -161,8 +233,8 @@ def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = 
     action_emoji = "📋" if use_copy else "➡"
     transfer_fn = copy_file if use_copy else move_file
 
-    log.info("CLI Swap avviato: A=%s B=%s dry_run=%s copy=%s",
-             folder_a, folder_b, dry_run, use_copy)
+    log.info("CLI Swap avviato: A=%s B=%s dry_run=%s copy=%s rename_after=%s",
+             folder_a, folder_b, dry_run, use_copy, rename_after)
 
     print(f"\n{'=' * 60}")
     print(f"  Agente File Organizer — Modalità SWAP")
@@ -184,6 +256,8 @@ def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = 
     folder_b_name = folder_b.name
     folder_a_filenames = [e["path"].name for e in files_a]
     folder_b_filenames = [e["path"].name for e in files_b]
+    projected_a = list(folder_a_filenames)
+    projected_b = list(folder_b_filenames)
 
     total = len(files_a) + len(files_b)
     print(f"  Trovati {len(files_a)} file in '{folder_a_name}' e {len(files_b)} file in '{folder_b_name}'.")
@@ -216,6 +290,9 @@ def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = 
             if not dry_run:
                 transfer_fn(file_path, folder_b)
                 print(f"     {action_emoji} Eseguito")
+            if not use_copy:
+                _remove_one_name(projected_a, file_path.name)
+            projected_b.append(file_path.name)
             moved_count += 1
 
     # 3. Classifica i file della cartella B
@@ -242,15 +319,28 @@ def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = 
             if not dry_run:
                 transfer_fn(file_path, folder_a)
                 print(f"     {action_emoji} Eseguito")
+            if not use_copy:
+                _remove_one_name(projected_b, file_path.name)
+            projected_a.append(file_path.name)
             moved_count += 1
 
     # 4. Riepilogo finale
+    renamed = []
+    if rename_after:
+        renamed = _handle_projected_folder_renames(
+            [folder_a, folder_b],
+            [projected_a, projected_b],
+            dry_run,
+        )
+
     log.info("CLI Swap completato: %d analizzati, %d spostati, %d restano",
              total, moved_count, stayed_count)
     print(f"\n{'=' * 60}")
     print(f"  Riepilogo: {total} file analizzati.")
     print(f"    📁 Da spostare: {moved_count}")
     print(f"    ✅ Già al posto giusto: {stayed_count}")
+    if rename_after:
+        print(f"    Cartelle rinominate: {len(renamed)}")
 
     if dry_run:
         print("  ℹ  Nessun file è stato modificato (modalità dry run).")
@@ -259,7 +349,12 @@ def swap(folder_a: Path, folder_b: Path, dry_run: bool = True, use_copy: bool = 
     print(f"{'=' * 60}\n")
 
 
-def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False) -> None:
+def multiswap(
+    folders: list[Path],
+    dry_run: bool = True,
+    use_copy: bool = False,
+    rename_after: bool = False,
+) -> None:
     """
     Analizza N cartelle e sposta/copia ogni file nella cartella piu' coerente.
 
@@ -270,8 +365,8 @@ def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False)
     transfer_fn = copy_file if use_copy else move_file
 
     log.info(
-        "CLI MultiSwap avviato: cartelle=%s dry_run=%s copy=%s",
-        [str(folder) for folder in folders], dry_run, use_copy,
+        "CLI MultiSwap avviato: cartelle=%s dry_run=%s copy=%s rename_after=%s",
+        [str(folder) for folder in folders], dry_run, use_copy, rename_after,
     )
 
     print(f"\n{'=' * 60}")
@@ -284,6 +379,10 @@ def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False)
     print(f"{'=' * 60}\n")
 
     all_files = [scan_folder(folder) for folder in folders]
+    projected_names = [
+        [entry["path"].name for entry in files]
+        for files in all_files
+    ]
     total = sum(len(files) for files in all_files)
     if total == 0:
         print("  Tutte le cartelle sono vuote. Niente da fare!")
@@ -341,7 +440,14 @@ def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False)
                     log.exception("CLI MultiSwap: errore esecuzione su %s", file_path)
                     print(f"     [ERRORE] {exc}")
                     continue
+            if not use_copy:
+                _remove_one_name(projected_names[origin_idx], file_path.name)
+            projected_names[dest_idx].append(file_path.name)
             moved_count += 1
+
+    renamed = []
+    if rename_after:
+        renamed = _handle_projected_folder_renames(folders, projected_names, dry_run)
 
     log.info(
         "CLI MultiSwap completato: %d analizzati, %d spostati, %d restano, %d errori",
@@ -352,6 +458,8 @@ def multiswap(folders: list[Path], dry_run: bool = True, use_copy: bool = False)
     print(f"    Da spostare: {moved_count}")
     print(f"    Gia' al posto giusto: {stayed_count}")
     print(f"    Errori: {failed_count}")
+    if rename_after:
+        print(f"    Cartelle rinominate: {len(renamed)}")
     if dry_run:
         print("  Nessun file e' stato modificato (modalita dry run).")
         print("  Rilancia con --execute per eseguire.")
@@ -578,6 +686,10 @@ def main() -> None:
         help="Copia i file invece di spostarli."
     )
     swap_parser.add_argument(
+        "--rename-folders", action="store_true", default=False,
+        help="Dopo lo swap propone/applica rinomine alle cartelle in base ai file finali."
+    )
+    swap_parser.add_argument(
         "--tier", type=str, default=None,
         choices=["lite", "standard", "pro", "ultra"],
         help="Tier del modello da usare (default: da configurazione)."
@@ -598,6 +710,10 @@ def main() -> None:
     multiswap_parser.add_argument(
         "--copy", action="store_true", default=False,
         help="Copia i file invece di spostarli."
+    )
+    multiswap_parser.add_argument(
+        "--rename-folders", action="store_true", default=False,
+        help="Dopo il multi-swap propone/applica rinomine alle cartelle in base ai file finali."
     )
     multiswap_parser.add_argument(
         "--tier", type=str, default=None,
@@ -677,7 +793,13 @@ def main() -> None:
         if not _ensure_model(tier):
             return
         init_classifier(tier)
-        swap(folder_a, folder_b, dry_run=not args.execute, use_copy=args.copy)
+        swap(
+            folder_a,
+            folder_b,
+            dry_run=not args.execute,
+            use_copy=args.copy,
+            rename_after=args.rename_folders,
+        )
 
     elif args.command == "multiswap":
         folders = [Path(p) for p in args.folders]
@@ -702,7 +824,12 @@ def main() -> None:
         if not _ensure_model(tier):
             return
         init_classifier(tier)
-        multiswap(folders, dry_run=not args.execute, use_copy=args.copy)
+        multiswap(
+            folders,
+            dry_run=not args.execute,
+            use_copy=args.copy,
+            rename_after=args.rename_folders,
+        )
 
     elif args.command == "rename-folders":
         root = Path(args.folder)

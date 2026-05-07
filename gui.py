@@ -42,7 +42,7 @@ from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QI
 
 from utils import (
     scan_folder, move_file, copy_file, format_size, sanitize_category,
-    build_folder_profile, rename_folder_safe,
+    build_folder_profile, build_folder_profile_from_names, rename_folder_safe,
 )
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
@@ -972,6 +972,46 @@ class FolderRenameAnalyzeWorker(QThread):
             self.error.emit(str(e))
 
 
+class ProjectedFolderRenameAnalyzeWorker(QThread):
+    """Analizza profili cartella gia' proiettati dopo uno swap."""
+    progress = Signal(int, str, str, str, float, str, str, str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, profiles: list[dict]):
+        super().__init__()
+        self.profiles = profiles
+
+    def run(self):
+        try:
+            log.info(
+                "Analisi RenameFolders post-swap avviata: %d cartelle",
+                len(self.profiles),
+            )
+            for idx, profile in enumerate(self.profiles):
+                if self.isInterruptionRequested():
+                    log.info("Analisi RenameFolders post-swap interrotta")
+                    self.error.emit("Operazione interrotta.")
+                    return
+
+                suggestion = suggest_folder_rename(profile)
+                self.progress.emit(
+                    idx,
+                    str(profile["path"]),
+                    str(profile["current_name"]),
+                    suggestion["suggested_name"],
+                    float(suggestion["confidence"]),
+                    suggestion["action"],
+                    suggestion["reason"],
+                    str(profile.get("file_count", 0)),
+                )
+            log.info("Analisi RenameFolders post-swap completata")
+            self.finished.emit()
+        except Exception as e:
+            log.exception("Analisi RenameFolders post-swap fallita")
+            self.error.emit(str(e))
+
+
 class FolderRenameExecuteWorker(QThread):
     """Esegue rename cartelle selezionate."""
     progress = Signal(int, str)
@@ -1106,6 +1146,110 @@ def _mark_row_error(table: QTableWidget, row: int):
 
 
 # ── Tab Organizza ─────────────────────────────────────────────────────
+
+def _remove_one_name(names: list[str], target: str):
+    """Rimuove una singola occorrenza per nome file, se presente."""
+    try:
+        names.pop(names.index(target))
+    except ValueError:
+        pass
+
+
+def _selected_folder_rename_items(table: QTableWidget, items: list[dict]) -> list[tuple[int, dict]]:
+    selected: list[tuple[int, dict]] = []
+    for row in range(table.rowCount()):
+        checkbox = table.item(row, 0)
+        if row >= len(items) or checkbox is None:
+            continue
+        entry = items[row]
+        if entry.get("action") == "rename" and checkbox.checkState() == Qt.Checked:
+            selected.append((row, entry))
+    return selected
+
+
+def _append_folder_rename_row(
+    table: QTableWidget,
+    items: list[dict],
+    idx: int,
+    path: str,
+    current_name: str,
+    suggested_name: str,
+    confidence: float,
+    action: str,
+    reason: str,
+    file_count: str,
+):
+    row = table.rowCount()
+    table.insertRow(row)
+
+    should_rename = action == "rename"
+    checkbox = QTableWidgetItem()
+    if should_rename:
+        checkbox.setCheckState(Qt.Checked)
+        checkbox.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+    else:
+        checkbox.setCheckState(Qt.Unchecked)
+        checkbox.setFlags(Qt.ItemIsEnabled)
+    table.setItem(row, 0, checkbox)
+
+    decision = "Rinomina" if should_rename else "Mantieni"
+    values = [
+        current_name,
+        suggested_name,
+        f"{confidence:.2f}",
+        decision,
+        str(file_count),
+        reason,
+    ]
+    for col, text in enumerate(values, start=1):
+        table_item = QTableWidgetItem(text)
+        if not should_rename:
+            _set_item_colors(table_item, "#7a7a7a", None)
+        table.setItem(row, col, table_item)
+
+    items.append({
+        "path": path,
+        "current_name": current_name,
+        "suggested_name": suggested_name,
+        "confidence": confidence,
+        "action": action,
+        "reason": reason,
+        "file_count": file_count,
+    })
+
+
+def _execute_folder_renames_inline(
+    table: QTableWidget,
+    items: list[dict],
+) -> list[dict]:
+    """Esegue le rinomine selezionate e ritorna quelle riuscite."""
+    selected = _selected_folder_rename_items(table, items)
+    successful: list[dict] = []
+    ordered = sorted(
+        selected,
+        key=lambda pair: len(Path(pair[1]["path"]).parts),
+        reverse=True,
+    )
+
+    for row, entry in ordered:
+        try:
+            source = Path(entry["path"])
+            final = rename_folder_safe(source, entry["suggested_name"])
+            done = dict(entry)
+            done["final_path"] = str(final)
+            done["final_name"] = final.name
+            successful.append(done)
+
+            table.setItem(row, 1, QTableWidgetItem(final.name))
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item:
+                    _set_item_colors(item, "#6a9a6a", None)
+        except Exception:
+            log.exception("Rinomina cartella post-swap fallita: %s", entry.get("path"))
+            _mark_row_error(table, row)
+    return successful
+
 
 class OrganizeTab(QWidget):
     operation_completed = Signal(dict)  # segnale per cronologia
@@ -1297,6 +1441,7 @@ class OrganizeTab(QWidget):
         self.progress_bar.setRange(0, len(selected))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+
         action = "Copia" if use_copy else "Spostamento"
         self.status_label.setText(f"{action} in corso...")
 
@@ -1356,7 +1501,9 @@ class SwapTab(QWidget):
         super().__init__()
         self._worker = None
         self._exec_worker = None
+        self._rename_worker = None
         self._analyzed_items: list[dict] = []
+        self._rename_items: list[dict] = []
         self._folder_a: Path | None = None
         self._folder_b: Path | None = None
         self._init_ui()
@@ -1420,6 +1567,11 @@ class SwapTab(QWidget):
         group.addButton(self.radio_copy)
         opts_layout.addWidget(self.radio_move)
         opts_layout.addWidget(self.radio_copy)
+        self.rename_after_swap_chk = QCheckBox("Proponi rinomina cartelle")
+        self.rename_after_swap_chk.setToolTip(
+            "Dopo l'analisi dello swap propone nomi cartella basati sui file previsti."
+        )
+        opts_layout.addWidget(self.rename_after_swap_chk)
         opts_layout.addStretch()
 
         self.analyze_btn = QPushButton("Analizza scambio")
@@ -1445,6 +1597,32 @@ class SwapTab(QWidget):
         header.sectionClicked.connect(self._toggle_select_all)
         self._select_all_checked = True
         layout.addWidget(self.table, stretch=1)
+
+        self.rename_label = QLabel("Rinomina cartelle post-swap")
+        self.rename_label.setObjectName("statusLabel")
+        self.rename_label.setVisible(False)
+        layout.addWidget(self.rename_label)
+
+        self.rename_table = QTableWidget(0, 7)
+        self.rename_table.setHorizontalHeaderLabels([
+            "", "Cartella", "Nome proposto", "Confidenza", "Decisione", "File", "Motivo"
+        ])
+        self.rename_table.setAlternatingRowColors(True)
+        self.rename_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.rename_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        rename_header = self.rename_table.horizontalHeader()
+        rename_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        rename_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        rename_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self.rename_table.setColumnWidth(0, 40)
+        self._rename_select_all_checked = True
+        rename_header.sectionClicked.connect(self._toggle_rename_select_all)
+        self.rename_table.setVisible(False)
+        layout.addWidget(self.rename_table, stretch=0)
 
         # ── Barra progresso e bottoni ──
         self.progress_bar = QProgressBar()
@@ -1503,6 +1681,116 @@ class SwapTab(QWidget):
             if item and (item.flags() & Qt.ItemIsUserCheckable):
                 item.setCheckState(Qt.Checked if self._select_all_checked else Qt.Unchecked)
 
+    def _toggle_rename_select_all(self, index):
+        if index != 0:
+            return
+        self._rename_select_all_checked = not self._rename_select_all_checked
+        for row in range(self.rename_table.rowCount()):
+            item = self.rename_table.item(row, 0)
+            if item and (item.flags() & Qt.ItemIsUserCheckable):
+                item.setCheckState(Qt.Checked if self._rename_select_all_checked else Qt.Unchecked)
+
+    def _clear_rename_preview(self):
+        self.rename_table.setRowCount(0)
+        self.rename_table.setVisible(False)
+        self.rename_label.setVisible(False)
+        self._rename_items.clear()
+
+    def _projected_folder_profiles(self) -> list[dict]:
+        if not self._folder_a or not self._folder_b:
+            return []
+
+        names_a = [entry["path"].name for entry in scan_folder(self._folder_a)]
+        names_b = [entry["path"].name for entry in scan_folder(self._folder_b)]
+        use_copy = self.radio_copy.isChecked()
+
+        for item in self._analyzed_items:
+            if item["stays"]:
+                continue
+            filename = item["filename"]
+            if item["origin"] == "A":
+                if not use_copy:
+                    _remove_one_name(names_a, filename)
+                names_b.append(filename)
+            else:
+                if not use_copy:
+                    _remove_one_name(names_b, filename)
+                names_a.append(filename)
+
+        return [
+            build_folder_profile_from_names(self._folder_a, names_a),
+            build_folder_profile_from_names(self._folder_b, names_b),
+        ]
+
+    def _start_projected_rename_analysis(self):
+        if not is_folder_rename_allowed():
+            self.status_label.setText(
+                self.status_label.text()
+                + " Rinomina cartelle disabilitata nelle Impostazioni."
+            )
+            return
+
+        profiles = self._projected_folder_profiles()
+        if not profiles:
+            return
+
+        self._clear_rename_preview()
+        self.rename_table.setVisible(True)
+        self.rename_label.setVisible(True)
+        self.execute_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setText("Analisi nomi cartelle post-swap...")
+
+        self._rename_worker = ProjectedFolderRenameAnalyzeWorker(profiles)
+        self._rename_worker.progress.connect(self._on_rename_analyze_progress)
+        self._rename_worker.finished.connect(self._on_rename_analyze_finished)
+        self._rename_worker.error.connect(self._on_rename_analyze_error)
+        self._rename_worker.start()
+
+    def _on_rename_analyze_progress(
+        self, idx, path, current_name, suggested_name, confidence, action, reason, file_count
+    ):
+        _append_folder_rename_row(
+            self.rename_table, self._rename_items, idx, path, current_name,
+            suggested_name, confidence, action, reason, file_count,
+        )
+        self.status_label.setText(f"Analisi nome cartella {idx + 1}...")
+
+    def _on_rename_analyze_finished(self):
+        self._rename_worker = None
+        to_move = sum(1 for item in self._analyzed_items if not item["stays"])
+        to_rename = sum(1 for item in self._rename_items if item["action"] == "rename")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.status_label.setText(
+            f"Analisi completata: {len(self._analyzed_items)} file, "
+            f"{to_move} da spostare, {to_rename} rinomine proposte."
+        )
+        self.execute_btn.setEnabled(to_move > 0 or to_rename > 0)
+
+    def _on_rename_analyze_error(self, msg):
+        self._rename_worker = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        to_move = sum(1 for item in self._analyzed_items if not item["stays"])
+        self.execute_btn.setEnabled(to_move > 0)
+        self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+
+    def _apply_renamed_folder_paths(self, renamed: list[dict]):
+        for item in renamed:
+            final_path = item.get("final_path")
+            if not final_path:
+                continue
+            old_key = _path_key(Path(item["path"]))
+            final = Path(final_path)
+            if self._folder_a and _path_key(self._folder_a) == old_key:
+                self._folder_a = final
+                self.path_a.setText(str(final))
+            if self._folder_b and _path_key(self._folder_b) == old_key:
+                self._folder_b = final
+                self.path_b.setText(str(final))
+
     def _start_analyze(self):
         if not self._folder_a or not self._folder_b:
             return
@@ -1510,6 +1798,8 @@ class SwapTab(QWidget):
             self.status_label.setText("Le due cartelle devono essere diverse.")
             return
         if self._worker is not None and self._worker.isRunning():
+            return
+        if self._rename_worker is not None and self._rename_worker.isRunning():
             return
         if not _check_model_ready(self):
             return
@@ -1519,6 +1809,7 @@ class SwapTab(QWidget):
 
         self.table.setRowCount(0)
         self._analyzed_items.clear()
+        self._clear_rename_preview()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -1575,6 +1866,8 @@ class SwapTab(QWidget):
         self.status_label.setText(f"Analisi completata: {n} file analizzati, {to_move} da spostare.")
         self.analyze_btn.setEnabled(True)
         self.execute_btn.setEnabled(to_move > 0)
+        if self.rename_after_swap_chk.isChecked():
+            self._start_projected_rename_analysis()
 
     def _on_analyze_error(self, msg):
         self._worker = None
@@ -1593,16 +1886,26 @@ class SwapTab(QWidget):
                 selected.append(entry)
                 self._exec_row_map.append(row)
 
-        if not selected:
-            self.status_label.setText("Nessun file selezionato.")
+        use_copy = self.radio_copy.isChecked()
+        selected_renames = _selected_folder_rename_items(self.rename_table, self._rename_items)
+        if not selected and not selected_renames:
+            self.status_label.setText("Nessun file o cartella selezionata.")
             return
 
-        use_copy = self.radio_copy.isChecked()
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
-        self.progress_bar.setRange(0, len(selected))
+        self.progress_bar.setRange(0, max(len(selected), 1))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+
+        if not selected:
+            self.status_label.setText("Rinomina cartelle in corso...")
+            renamed = []
+            if is_folder_rename_allowed():
+                renamed = _execute_folder_renames_inline(self.rename_table, self._rename_items)
+            self._on_exec_finished(0, [], use_copy, renamed)
+            return
+
         action = "Copia" if use_copy else "Spostamento"
         self.status_label.setText(f"{action} in corso...")
 
@@ -1621,10 +1924,9 @@ class SwapTab(QWidget):
         action = "Copia" if self.radio_copy.isChecked() else "Spostamento"
         self.status_label.setText(f"{action} {idx + 1}/{total}...")
 
-    def _on_exec_finished(self, count, selected, use_copy):
+    def _on_exec_finished(self, count, selected, use_copy, renamed=None):
         self._exec_worker = None
         action = "copiati" if use_copy else "spostati"
-        self.status_label.setText(f"Completato! {count} file {action}.")
         self.analyze_btn.setEnabled(True)
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, max(count, 1))
@@ -1632,6 +1934,30 @@ class SwapTab(QWidget):
 
         success_indices = getattr(self, "_exec_success_indices", [])
         successful = [selected[i] for i in success_indices if i < len(selected)]
+        if renamed is None:
+            renamed = []
+            if is_folder_rename_allowed():
+                renamed = _execute_folder_renames_inline(self.rename_table, self._rename_items)
+            elif _selected_folder_rename_items(self.rename_table, self._rename_items):
+                self.status_label.setText("Rinomina cartelle disabilitata nelle Impostazioni.")
+
+        rename_count = len(renamed)
+        self._apply_renamed_folder_paths(renamed)
+        rename_text = f", {rename_count} cartelle rinominate" if rename_count else ""
+        self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+
+        file_details = [
+            {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
+            for s in successful
+        ]
+        rename_details = [
+            {
+                "file": f"[cartella] {s['current_name']}",
+                "from": s["current_name"],
+                "to": s.get("final_name", s["suggested_name"]),
+            }
+            for s in renamed
+        ]
 
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -1639,10 +1965,8 @@ class SwapTab(QWidget):
             "folders": [str(self._folder_a), str(self._folder_b)],
             "mode": "Copia" if use_copy else "Sposta",
             "file_count": count,
-            "files": [
-                {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
-                for s in successful
-            ],
+            "folder_rename_count": rename_count,
+            "files": file_details + rename_details,
         }
         self.operation_completed.emit(entry)
 
@@ -1733,8 +2057,10 @@ class MultiSwapTab(QWidget):
         super().__init__()
         self._worker: MultiSwapAnalyzeWorker | None = None
         self._exec_worker: MultiSwapExecuteWorker | None = None
+        self._rename_worker: ProjectedFolderRenameAnalyzeWorker | None = None
         self._slots: list[FolderSlot] = []
         self._analyzed_items: list[dict] = []
+        self._rename_items: list[dict] = []
         self._folders: list[Path] = []
         self._init_ui()
         for _ in range(self.INITIAL_SLOTS):
@@ -1787,6 +2113,11 @@ class MultiSwapTab(QWidget):
         group.addButton(self.radio_copy)
         opts.addWidget(self.radio_move)
         opts.addWidget(self.radio_copy)
+        self.rename_after_swap_chk = QCheckBox("Proponi rinomina cartelle")
+        self.rename_after_swap_chk.setToolTip(
+            "Dopo l'analisi propone nomi cartella basati sul contenuto finale previsto."
+        )
+        opts.addWidget(self.rename_after_swap_chk)
         opts.addStretch()
         self.analyze_btn = QPushButton("Analizza scambio")
         self.analyze_btn.setObjectName("accentBtn")
@@ -1814,6 +2145,32 @@ class MultiSwapTab(QWidget):
         self._select_all_checked = True
         header.sectionClicked.connect(self._toggle_select_all)
         layout.addWidget(self.table, stretch=1)
+
+        self.rename_label = QLabel("Rinomina cartelle post-swap")
+        self.rename_label.setObjectName("statusLabel")
+        self.rename_label.setVisible(False)
+        layout.addWidget(self.rename_label)
+
+        self.rename_table = QTableWidget(0, 7)
+        self.rename_table.setHorizontalHeaderLabels([
+            "", "Cartella", "Nome proposto", "Confidenza", "Decisione", "File", "Motivo"
+        ])
+        self.rename_table.setAlternatingRowColors(True)
+        self.rename_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.rename_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        rename_header = self.rename_table.horizontalHeader()
+        rename_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        rename_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        rename_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        rename_header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self.rename_table.setColumnWidth(0, 40)
+        self._rename_select_all_checked = True
+        rename_header.sectionClicked.connect(self._toggle_rename_select_all)
+        self.rename_table.setVisible(False)
+        layout.addWidget(self.rename_table, stretch=0)
 
         # Progress + Esegui
         self.progress_bar = QProgressBar()
@@ -1914,6 +2271,7 @@ class MultiSwapTab(QWidget):
         self.execute_btn.setEnabled(False)
         self.table.setRowCount(0)
         self._analyzed_items.clear()
+        self._clear_rename_preview()
 
     # ── Selezione tabella ───────────────────────────────────────────
 
@@ -1928,11 +2286,128 @@ class MultiSwapTab(QWidget):
 
     # ── Analisi ────────────────────────────────────────────────────
 
+    def _toggle_rename_select_all(self, index):
+        if index != 0:
+            return
+        self._rename_select_all_checked = not self._rename_select_all_checked
+        for row in range(self.rename_table.rowCount()):
+            item = self.rename_table.item(row, 0)
+            if item and (item.flags() & Qt.ItemIsUserCheckable):
+                item.setCheckState(Qt.Checked if self._rename_select_all_checked else Qt.Unchecked)
+
+    def _clear_rename_preview(self):
+        self.rename_table.setRowCount(0)
+        self.rename_table.setVisible(False)
+        self.rename_label.setVisible(False)
+        self._rename_items.clear()
+
+    def _projected_folder_profiles(self) -> list[dict]:
+        if not self._folders:
+            return []
+
+        projected_names: list[list[str]] = [
+            [entry["path"].name for entry in scan_folder(folder)]
+            for folder in self._folders
+        ]
+        use_copy = self.radio_copy.isChecked()
+
+        for item in self._analyzed_items:
+            if item["stays"]:
+                continue
+            origin_idx = item["origin_idx"]
+            dest_idx = item["dest_idx"]
+            filename = item["filename"]
+            if not (0 <= origin_idx < len(projected_names)):
+                continue
+            if not (0 <= dest_idx < len(projected_names)):
+                continue
+            if not use_copy:
+                _remove_one_name(projected_names[origin_idx], filename)
+            projected_names[dest_idx].append(filename)
+
+        return [
+            build_folder_profile_from_names(folder, names)
+            for folder, names in zip(self._folders, projected_names)
+        ]
+
+    def _start_projected_rename_analysis(self):
+        if not is_folder_rename_allowed():
+            self.status_label.setText(
+                self.status_label.text()
+                + " Rinomina cartelle disabilitata nelle Impostazioni."
+            )
+            return
+
+        profiles = self._projected_folder_profiles()
+        if not profiles:
+            return
+
+        self._clear_rename_preview()
+        self.rename_table.setVisible(True)
+        self.rename_label.setVisible(True)
+        self.execute_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setText("Analisi nomi cartelle post-swap...")
+
+        self._rename_worker = ProjectedFolderRenameAnalyzeWorker(profiles)
+        self._rename_worker.progress.connect(self._on_rename_analyze_progress)
+        self._rename_worker.finished.connect(self._on_rename_analyze_finished)
+        self._rename_worker.error.connect(self._on_rename_analyze_error)
+        self._rename_worker.start()
+
+    def _on_rename_analyze_progress(
+        self, idx, path, current_name, suggested_name, confidence, action, reason, file_count
+    ):
+        _append_folder_rename_row(
+            self.rename_table, self._rename_items, idx, path, current_name,
+            suggested_name, confidence, action, reason, file_count,
+        )
+        self.status_label.setText(f"Analisi nome cartella {idx + 1}...")
+
+    def _on_rename_analyze_finished(self):
+        self._rename_worker = None
+        to_move = sum(1 for item in self._analyzed_items if not item["stays"])
+        to_rename = sum(1 for item in self._rename_items if item["action"] == "rename")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.status_label.setText(
+            f"Analisi completata: {len(self._analyzed_items)} file, "
+            f"{to_move} da spostare, {to_rename} rinomine proposte."
+        )
+        self.execute_btn.setEnabled(to_move > 0 or to_rename > 0)
+
+    def _on_rename_analyze_error(self, msg):
+        self._rename_worker = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        to_move = sum(1 for item in self._analyzed_items if not item["stays"])
+        self.execute_btn.setEnabled(to_move > 0)
+        self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+
+    def _apply_renamed_folder_paths(self, renamed: list[dict]):
+        for item in renamed:
+            final_path = item.get("final_path")
+            if not final_path:
+                continue
+            old_key = _path_key(Path(item["path"]))
+            final = Path(final_path)
+            for idx, folder in enumerate(self._folders):
+                if _path_key(folder) == old_key:
+                    self._folders[idx] = final
+            for slot in self._slots:
+                slot_path = slot.get_path()
+                if slot_path and _path_key(Path(slot_path)) == old_key:
+                    slot._path = str(final)
+                    slot.path_edit.setText(str(final))
+
     def _start_analyze(self):
         valid = self._collect_valid_folders()
         if len(valid) < 2:
             return
         if self._worker is not None and self._worker.isRunning():
+            return
+        if self._rename_worker is not None and self._rename_worker.isRunning():
             return
         if not _check_model_ready(self):
             return
@@ -1943,6 +2418,7 @@ class MultiSwapTab(QWidget):
         self._folders = valid
         self.table.setRowCount(0)
         self._analyzed_items.clear()
+        self._clear_rename_preview()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
         self.add_btn.setEnabled(False)
@@ -2007,6 +2483,8 @@ class MultiSwapTab(QWidget):
         for slot in self._slots:
             slot.setEnabled(True)
         self.execute_btn.setEnabled(to_move > 0)
+        if self.rename_after_swap_chk.isChecked():
+            self._start_projected_rename_analysis()
 
     def _on_analyze_error(self, msg):
         self._worker = None
@@ -2030,19 +2508,29 @@ class MultiSwapTab(QWidget):
                 selected.append(entry)
                 self._exec_row_map.append(row)
 
-        if not selected:
-            self.status_label.setText("Nessun file selezionato.")
+        use_copy = self.radio_copy.isChecked()
+        selected_renames = _selected_folder_rename_items(self.rename_table, self._rename_items)
+        if not selected and not selected_renames:
+            self.status_label.setText("Nessun file o cartella selezionata.")
             return
 
-        use_copy = self.radio_copy.isChecked()
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
         self.add_btn.setEnabled(False)
         for slot in self._slots:
             slot.setEnabled(False)
-        self.progress_bar.setRange(0, len(selected))
+        self.progress_bar.setRange(0, max(len(selected), 1))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+
+        if not selected:
+            self.status_label.setText("Rinomina cartelle in corso...")
+            renamed = []
+            if is_folder_rename_allowed():
+                renamed = _execute_folder_renames_inline(self.rename_table, self._rename_items)
+            self._on_exec_finished(0, [], use_copy, renamed)
+            return
+
         action = "Copia" if use_copy else "Spostamento"
         self.status_label.setText(f"{action} in corso...")
 
@@ -2061,10 +2549,9 @@ class MultiSwapTab(QWidget):
         action = "Copia" if self.radio_copy.isChecked() else "Spostamento"
         self.status_label.setText(f"{action} {idx + 1}/{total}...")
 
-    def _on_exec_finished(self, count, selected, use_copy):
+    def _on_exec_finished(self, count, selected, use_copy, renamed=None):
         self._exec_worker = None
         action = "copiati" if use_copy else "spostati"
-        self.status_label.setText(f"Completato! {count} file {action}.")
         self.analyze_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         for slot in self._slots:
@@ -2073,6 +2560,30 @@ class MultiSwapTab(QWidget):
 
         success_indices = getattr(self, "_exec_success_indices", [])
         successful = [selected[i] for i in success_indices if i < len(selected)]
+        if renamed is None:
+            renamed = []
+            if is_folder_rename_allowed():
+                renamed = _execute_folder_renames_inline(self.rename_table, self._rename_items)
+            elif _selected_folder_rename_items(self.rename_table, self._rename_items):
+                self.status_label.setText("Rinomina cartelle disabilitata nelle Impostazioni.")
+
+        rename_count = len(renamed)
+        self._apply_renamed_folder_paths(renamed)
+        rename_text = f", {rename_count} cartelle rinominate" if rename_count else ""
+        self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+
+        file_details = [
+            {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
+            for s in successful
+        ]
+        rename_details = [
+            {
+                "file": f"[cartella] {s['current_name']}",
+                "from": s["current_name"],
+                "to": s.get("final_name", s["suggested_name"]),
+            }
+            for s in renamed
+        ]
 
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -2080,10 +2591,8 @@ class MultiSwapTab(QWidget):
             "folders": [str(f) for f in self._folders],
             "mode": "Copia" if use_copy else "Sposta",
             "file_count": count,
-            "files": [
-                {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
-                for s in successful
-            ],
+            "folder_rename_count": rename_count,
+            "files": file_details + rename_details,
         }
         self.operation_completed.emit(entry)
 
@@ -2400,11 +2909,16 @@ class HistoryTab(QWidget):
                 ts_display = ts
 
             folders_str = ", ".join(entry.get("folders", []))
+            file_count = entry.get("file_count", 0)
+            folder_rename_count = entry.get("folder_rename_count", 0)
+            count_display = str(file_count)
+            if folder_rename_count:
+                count_display = f"{file_count} + {folder_rename_count} cartelle"
             top = QTreeWidgetItem([
                 ts_display,
                 entry.get("type", ""),
                 folders_str,
-                str(entry.get("file_count", 0)),
+                count_display,
                 entry.get("mode", ""),
             ])
 
@@ -2562,8 +3076,9 @@ class SettingsTab(QWidget):
         rename_layout.addWidget(self.rename_checkbox)
 
         rename_info = QLabel(
-            "Quando attiva, la tab Rinomina cartelle puo' proporre nuovi nomi "
-            "in base ai file contenuti. Le rinomine restano sempre selettive e confermate."
+            "Quando attiva, la tab Rinomina cartelle e le opzioni di Swap/MultiSwap "
+            "possono proporre nuovi nomi in base ai file contenuti. Le rinomine "
+            "restano sempre selettive e confermate."
         )
         rename_info.setObjectName("statusLabel")
         rename_info.setWordWrap(True)
@@ -2907,8 +3422,10 @@ class MainWindow(QMainWindow):
             self.organize_tab._exec_worker,
             self.swap_tab._worker,
             self.swap_tab._exec_worker,
+            self.swap_tab._rename_worker,
             self.multi_swap_tab._worker,
             self.multi_swap_tab._exec_worker,
+            self.multi_swap_tab._rename_worker,
             self.folder_rename_tab._worker,
             self.folder_rename_tab._exec_worker,
             self.settings_tab._download_worker,

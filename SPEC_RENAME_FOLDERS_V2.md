@@ -19,12 +19,12 @@ La V2 e' piu' ambiziosa della V1: puo' proporre spostamenti, creazione di nuove 
 
 | Tema | V1 | V2 |
 | --- | --- | --- |
-| Obiettivo | Rinomina cartelle esistenti | Riorganizza e rinomina |
-| File spostati | No | Si, su conferma |
+| Obiettivo | Rinomina prudente, anche post-swap opzionale | Normalizzazione completa |
+| File spostati | Solo nei flussi Swap/MultiSwap gia' esistenti | Si, con piano dedicato |
 | Nuove cartelle | No | Si, se utili |
 | Ricorsione | No | Possibile, configurabile |
 | Rischio | Basso | Medio |
-| UI | Tab dedicata semplice | Wizard/preview piu' avanzata |
+| UI | Tab dedicata + opzione in Swap/MultiSwap | Wizard/preview piu' avanzata |
 
 ## Flusso Proposto
 

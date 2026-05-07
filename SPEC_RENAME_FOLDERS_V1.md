@@ -6,6 +6,10 @@ Permettere ad Agent Ordinatore di proporre nuovi nomi per cartelle esistenti in 
 
 La V1 deve essere prudente: analisi, anteprima, selezione manuale e poi esecuzione solo delle cartelle confermate.
 
+Estensione V1.1: la stessa logica prudente puo' essere richiamata dentro Swap e
+Swap multiplo come opzione post-swap. In quel caso il modello valuta il contenuto
+previsto dopo gli spostamenti/copie, poi propone eventuali rinomine cartella.
+
 ## Ambito
 
 - Analizza solo le cartelle selezionate dall'utente.
@@ -14,6 +18,8 @@ La V1 deve essere prudente: analisi, anteprima, selezione manuale e poi esecuzio
 - Non rinomina sottocartelle ricorsivamente.
 - Non rinomina cartelle se l'opzione globale e' disattivata.
 - Non rinomina cartelle che sembrano progetti o cartelle intenzionali, salvo scelta manuale futura.
+- Dentro Swap/MultiSwap, la rinomina e' opzionale per singola operazione e viene
+  eseguita solo dopo gli spostamenti/copie selezionati.
 
 ## Regole
 
@@ -91,6 +97,14 @@ Funzioni:
 
 Se l'opzione globale e' disattivata, la tab mostra un messaggio e non esegue rename.
 
+In `Swap` e `Swap multiplo` aggiungere l'opzione `Proponi rinomina cartelle`.
+Quando attiva:
+
+- dopo l'analisi file viene mostrata una preview separata delle cartelle;
+- ogni proposta resta selezionabile con checkbox;
+- l'esecuzione applica prima move/copy e poi `RENAME_FOLDER`;
+- la Cronologia mostra anche quante cartelle sono state rinominate.
+
 ## CLI
 
 Aggiungere comando:
@@ -99,6 +113,8 @@ Aggiungere comando:
 python main.py rename-folders "C:\Percorso"
 python main.py rename-folders "C:\Percorso" --execute
 python main.py rename-folders "C:\Percorso" --include-root
+python main.py swap "C:\A" "C:\B" --rename-folders
+python main.py multiswap "C:\A" "C:\B" "C:\C" --rename-folders
 ```
 
 Comportamento:
@@ -107,6 +123,8 @@ Comportamento:
 - dry-run di default;
 - con `--execute` rinomina solo le proposte `rename`;
 - con `--include-root` include anche la cartella passata.
+- con `--rename-folders` su `swap`/`multiswap` valuta nomi finali post-swap e,
+  con `--execute`, li rinomina dopo i file.
 
 ## Criteri Di Accettazione
 
@@ -117,3 +135,5 @@ Comportamento:
 - I conflitti non sovrascrivono cartelle esistenti.
 - Ogni rename riuscito finisce in `moves.log` con `RENAME_FOLDER`.
 - README e schema progetto documentano la nuova modalita.
+- Swap e MultiSwap possono includere la rinomina post-swap solo quando l'utente
+  abilita sia l'opzione globale sia l'opzione della singola operazione.
