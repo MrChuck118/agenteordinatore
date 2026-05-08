@@ -56,6 +56,11 @@ _PROJECT_MARKERS = {
     "yarn.lock",
 }
 
+_PROJECT_EXTENSION_MARKERS = {
+    ".csproj",
+    ".sln",
+}
+
 
 def scan_folder(folder: Path) -> list[dict]:
     """
@@ -164,6 +169,10 @@ def detect_project_markers(folder: Path) -> list[str]:
     for marker in sorted(_PROJECT_MARKERS):
         if (folder / marker).exists():
             markers.append(marker)
+    for item in sorted(folder.iterdir()):
+        ext = item.suffix.lower()
+        if item.is_file() and ext in _PROJECT_EXTENSION_MARKERS and ext not in markers:
+            markers.append(ext)
     return markers
 
 

@@ -53,6 +53,11 @@ Agente Ordinatore/
 |-- schema progetto.md          # Questo documento
 |-- SPEC_RENAME_FOLDERS_V1.md   # Spec prudente per rinomina cartelle esistenti
 |-- SPEC_RENAME_FOLDERS_V2.md   # Spec futura per normalizzazione semantica cartelle
+|-- tests/
+|   |-- __init__.py
+|   |-- test_brain.py           # Test parser rinomina cartelle
+|   |-- test_cli.py             # Test dry-run/execute CLI senza LLM reale
+|   `-- test_utils.py           # Test sanitizzazione, marker progetto e rename sicuro
 `-- utils.py                    # Scansione file, sanitizzazione categorie, move/copy sicuri e formattazione size
 ```
 
@@ -82,8 +87,10 @@ Note sulla struttura:
   - Comandi disponibili: `organize`, `swap`, `multiswap`, `rename-folders`, `setup`.
   - Modalita' dry-run di default, con `--execute` per applicare le modifiche.
   - Opzione `--copy` per copiare invece di spostare.
+  - Opzione `--rename-folders` per proporre rinomine post-swap/post-multiswap quando l'opzione globale e' abilitata.
   - Opzione `--tier` per scegliere il modello da CLI.
   - Comandi setup: `--download`, `--list`, `--delete`.
+  - Output compatibile con console Windows legacy: marker testuali ASCII come `[INFO]`, `[MOVE]`, `[COPY]`, `[OK]`.
 
 ### 2. Configurazione e dati applicazione
 
@@ -147,6 +154,7 @@ Le preferenze e i dati generati dall'app sono salvati fuori dal workspace:
     - limita la profondita' a 2 livelli;
     - restituisce sempre un path relativo.
   - `build_folder_profile()` crea un profilo leggero di una cartella usando nomi file, estensioni, dimensioni e marker progetto.
+  - `detect_project_markers()` protegge cartelle progetto tramite marker noti, incluse solution/progetti `.sln` e `.csproj`.
   - `rename_folder_safe()` rinomina cartelle nella stessa cartella padre, sanitizza il nome e risolve conflitti senza sovrascrivere.
   - `move_file()` e `copy_file()` creano la destinazione se serve e gestiscono conflitti aggiungendo timestamp con microsecondi.
   - Ogni move/copy/rename reale viene registrato in `moves.log`.
@@ -182,6 +190,22 @@ Formato principale:
 timestamp | livello | logger | messaggio
 timestamp | MOVE|COPY|RENAME_FOLDER | source -> destination
 ```
+
+---
+
+## Test Automatici
+
+La suite base usa `unittest` della standard library, quindi non richiede nuove dipendenze.
+
+```cmd
+python -m unittest discover -s tests -v
+```
+
+Copertura attuale:
+
+- `tests/test_utils.py`: sanitizzazione categorie/nomi, marker progetto `.sln`/`.csproj`, conflitti e `rename_folder_safe()`.
+- `tests/test_brain.py`: parsing JSON della rinomina cartelle, fallback sicuri e clamp della confidenza.
+- `tests/test_cli.py`: dry-run non distruttivo per rename cartelle/organize e execute controllato con AI mockata.
 
 ---
 
@@ -274,7 +298,10 @@ Lo schema e' aggiornato alla struttura corrente del progetto:
 - AI solo locale tramite GGUF e `llama-cpp-python`.
 - GUI PySide6 con tab Organizza, Swap, Swap multiplo, Rinomina cartelle, Cronologia e Impostazioni.
 - CLI completa con dry-run, execute, copy, tier, multiswap, rename-folders e setup modelli.
+- Output CLI compatibile con console Windows legacy tramite marker ASCII.
 - Storage modelli/config/log in `%LOCALAPPDATA%\AgentOrdinatore`.
 - Logging centralizzato con `app.log`, `moves.log`, `libs.log`; le rinomine cartelle sono tracciate come `RENAME_FOLDER`.
 - Sanitizzazione robusta delle categorie AI prima di creare path.
+- Marker progetto V1 completi per i casi previsti, incluse cartelle con `.sln` e `.csproj`.
+- Test automatici base presenti in `tests/` e lanciabili con `python -m unittest discover -s tests -v`.
 - Pipeline Windows per build portable, installer Inno Setup e ZIP distribuzione.

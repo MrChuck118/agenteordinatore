@@ -1,9 +1,9 @@
-"""    main.py — Orchestratore dell'agente di organizzazione file.
+"""    main.py - Orchestratore dell'agente di organizzazione file.
 
 Uso:
   python main.py organize <cartella>                                  # Dry run (default)
   python main.py organize <cartella> --execute                        # Esecuzione reale
-  python main.py organize <cartella> --copy                           # Dry run, modalità copia
+  python main.py organize <cartella> --copy                           # Dry run, modalita copia
   python main.py organize <cartella> --copy --execute                 # Esecuzione reale, copia
   python main.py organize <cartella> --tier pro                       # Usa modello Pro
   python main.py swap <cartella_a> <cartella_b>                       # Dry run swap binario
@@ -152,7 +152,7 @@ def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) 
     e lo sposta/copia (o simula) nella sottocartella appropriata.
     """
     action = "copia" if use_copy else "spostamento"
-    action_emoji = "📋" if use_copy else "➡"
+    action_label = "[COPY]" if use_copy else "[MOVE]"
     transfer_fn = copy_file if use_copy else move_file
     action_verb_past = "Copiato" if use_copy else "Spostato"
 
@@ -162,8 +162,8 @@ def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) 
     print(f"\n{'=' * 60}")
     print(f"  Agente File Organizer")
     print(f"  Cartella: {target_folder.resolve()}")
-    print(f"  Modalità: {'🔍 DRY RUN (simulazione)' if dry_run else '🚀 ESECUZIONE REALE'}")
-    print(f"  Operazione: {action_emoji} {action}")
+    print(f"  Modalita: {'DRY RUN (simulazione)' if dry_run else 'ESECUZIONE REALE'}")
+    print(f"  Operazione: {action_label} {action}")
     print(f"{'=' * 60}\n")
 
     # 1. Scansiona la cartella
@@ -183,19 +183,19 @@ def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) 
         file_size = entry["size"]
         size_str = format_size(file_size)
 
-        print(f"  📄 {file_path.name}  ({size_str})")
+        print(f"  [FILE] {file_path.name}  ({size_str})")
 
         # Chiedi all'LLM la categoria
         category = sanitize_category(classify_file(file_path.name, size_str))
         dest_folder = target_folder / category
 
-        print(f"     → Categoria: {category}")
+        print(f"     -> Categoria: {category}")
 
         if dry_run:
-            print(f"     → [DRY RUN] Verrebbe {action} in: {dest_folder}/")
+            print(f"     -> [DRY RUN] Verrebbe {action} in: {dest_folder}/")
         else:
             final_path = transfer_fn(file_path, dest_folder)
-            print(f"     {action_emoji} {action_verb_past} in: {final_path}")
+            print(f"     {action_label} {action_verb_past} in: {final_path}")
 
         results.append(
             {
@@ -212,8 +212,8 @@ def organize(target_folder: Path, dry_run: bool = True, use_copy: bool = False) 
     print(f"  Riepilogo: {len(results)} file elaborati.")
 
     if dry_run:
-        print("  ℹ  Nessun file è stato modificato (modalità dry run).")
-        print(f"  ➡  Rilancia con --execute per eseguire.")
+        print("  [INFO] Nessun file e' stato modificato (modalita dry run).")
+        print("  [INFO] Rilancia con --execute per eseguire.")
 
     print(f"{'=' * 60}\n")
 
@@ -230,18 +230,18 @@ def swap(
     nella cartella giusta in base alla "vocazione" di ciascuna.
     """
     action = "copia" if use_copy else "spostamento"
-    action_emoji = "📋" if use_copy else "➡"
+    action_label = "[COPY]" if use_copy else "[MOVE]"
     transfer_fn = copy_file if use_copy else move_file
 
     log.info("CLI Swap avviato: A=%s B=%s dry_run=%s copy=%s rename_after=%s",
              folder_a, folder_b, dry_run, use_copy, rename_after)
 
     print(f"\n{'=' * 60}")
-    print(f"  Agente File Organizer — Modalità SWAP")
+    print(f"  Agente File Organizer - Modalita SWAP")
     print(f"  Cartella A: {folder_a.resolve()}")
     print(f"  Cartella B: {folder_b.resolve()}")
-    print(f"  Modalità: {'🔍 DRY RUN (simulazione)' if dry_run else '🚀 ESECUZIONE REALE'}")
-    print(f"  Operazione: {action_emoji} {action}")
+    print(f"  Modalita: {'DRY RUN (simulazione)' if dry_run else 'ESECUZIONE REALE'}")
+    print(f"  Operazione: {action_label} {action}")
     print(f"{'=' * 60}\n")
 
     # 1. Scansiona entrambe le cartelle
@@ -283,13 +283,13 @@ def swap(
         )
 
         if destination is None or destination == "A":
-            print(f"  ✅ {file_path.name}: {folder_a_name} → resta in {folder_a_name}")
+            print(f"  [OK] {file_path.name}: {folder_a_name} -> resta in {folder_a_name}")
             stayed_count += 1
         else:
-            print(f"  📁 {file_path.name}: {folder_a_name} → {folder_b_name}")
+            print(f"  [MOVE] {file_path.name}: {folder_a_name} -> {folder_b_name}")
             if not dry_run:
                 transfer_fn(file_path, folder_b)
-                print(f"     {action_emoji} Eseguito")
+                print(f"     {action_label} Eseguito")
             if not use_copy:
                 _remove_one_name(projected_a, file_path.name)
             projected_b.append(file_path.name)
@@ -312,13 +312,13 @@ def swap(
         )
 
         if destination is None or destination == "B":
-            print(f"  ✅ {file_path.name}: {folder_b_name} → resta in {folder_b_name}")
+            print(f"  [OK] {file_path.name}: {folder_b_name} -> resta in {folder_b_name}")
             stayed_count += 1
         else:
-            print(f"  📁 {file_path.name}: {folder_b_name} → {folder_a_name}")
+            print(f"  [MOVE] {file_path.name}: {folder_b_name} -> {folder_a_name}")
             if not dry_run:
                 transfer_fn(file_path, folder_a)
-                print(f"     {action_emoji} Eseguito")
+                print(f"     {action_label} Eseguito")
             if not use_copy:
                 _remove_one_name(projected_b, file_path.name)
             projected_a.append(file_path.name)
@@ -337,14 +337,14 @@ def swap(
              total, moved_count, stayed_count)
     print(f"\n{'=' * 60}")
     print(f"  Riepilogo: {total} file analizzati.")
-    print(f"    📁 Da spostare: {moved_count}")
-    print(f"    ✅ Già al posto giusto: {stayed_count}")
+    print(f"    Da spostare: {moved_count}")
+    print(f"    Gia' al posto giusto: {stayed_count}")
     if rename_after:
         print(f"    Cartelle rinominate: {len(renamed)}")
 
     if dry_run:
-        print("  ℹ  Nessun file è stato modificato (modalità dry run).")
-        print(f"  ➡  Rilancia con --execute per eseguire.")
+        print("  [INFO] Nessun file e' stato modificato (modalita dry run).")
+        print("  [INFO] Rilancia con --execute per eseguire.")
 
     print(f"{'=' * 60}\n")
 
@@ -554,7 +554,7 @@ def rename_folders(root_folder: Path, dry_run: bool = True, include_root: bool =
 def setup_command(args) -> None:
     """Gestisce il subcommand 'setup'."""
 
-    # ── Download modello ──
+    # Download modello
     if args.download:
         tier = args.download
         if tier not in MODELS:
@@ -562,7 +562,7 @@ def setup_command(args) -> None:
             return
 
         if is_model_downloaded(tier):
-            print(f"  Il modello '{tier}' ({MODELS[tier]['name']}) è già scaricato.")
+            print(f"  Il modello '{tier}' ({MODELS[tier]['name']}) e' gia' scaricato.")
             return
 
         info = MODELS[tier]
@@ -579,7 +579,7 @@ def setup_command(args) -> None:
             print(f"\n  Errore durante il download: {e}")
         return
 
-    # ── Elimina modello ──
+    # Elimina modello
     if args.delete:
         tier = args.delete
         if tier not in MODELS:
@@ -592,7 +592,7 @@ def setup_command(args) -> None:
             print(f"  Modello '{tier}' non presente sul disco.")
         return
 
-    # ── Lista modelli scaricati ──
+    # Lista modelli scaricati
     if args.list:
         downloaded = get_downloaded_models()
         if not downloaded:
@@ -604,11 +604,11 @@ def setup_command(args) -> None:
                 print(f"    - {tier}: {info['name']} ({info['filename']})")
         return
 
-    # ── Default: mostra hardware e modelli ──
+    # Default: mostra hardware e modelli
     from hardware import detect_hardware, get_available_tiers
 
     print(f"\n{'=' * 60}")
-    print(f"  Agent Ordinatore — Setup")
+    print(f"  Agent Ordinatore - Setup")
     print(f"{'=' * 60}\n")
 
     hw = detect_hardware()
@@ -629,10 +629,11 @@ def setup_command(args) -> None:
         if is_model_downloaded(t["tier"]):
             status = " [SCARICATO]"
         elif not t["available"]:
-            status = " [BLOCCATO — RAM insufficiente]"
+            status = " [BLOCCATO - RAM insufficiente]"
 
-        rec = " ⭐ CONSIGLIATO" if t["recommended"] else ""
-        print(f"    {'●' if t['recommended'] else '○'} {t['tier']:10s} — {t['model']} ({t['size_gb']} GB){rec}{status}")
+        rec = " [CONSIGLIATO]" if t["recommended"] else ""
+        marker = "*" if t["recommended"] else "-"
+        print(f"    {marker} {t['tier']:10s} - {t['model']} ({t['size_gb']} GB){rec}{status}")
 
     print(f"\n  Per scaricare un modello: python main.py setup --download <tier>")
     print(f"{'=' * 60}\n")
@@ -753,7 +754,7 @@ def main() -> None:
     )
     setup_parser.add_argument(
         "--list", action="store_true", default=False,
-        help="Lista i modelli già scaricati."
+        help="Lista i modelli gia' scaricati."
     )
     setup_parser.add_argument(
         "--delete", type=str, default=None, metavar="TIER",
@@ -766,7 +767,7 @@ def main() -> None:
         target = Path(args.folder)
         if not target.is_dir():
             log.error("CLI Organize: cartella non valida: %s", target)
-            print(f"  Errore: '{target}' non è una cartella valida.")
+            print(f"  Errore: '{target}' non e' una cartella valida.")
             return
         tier = args.tier or get_selected_tier()
         if not _ensure_model(tier):
@@ -779,11 +780,11 @@ def main() -> None:
         folder_b = Path(args.folder_b)
         if not folder_a.is_dir():
             log.error("CLI Swap: cartella A non valida: %s", folder_a)
-            print(f"  Errore: '{folder_a}' non è una cartella valida.")
+            print(f"  Errore: '{folder_a}' non e' una cartella valida.")
             return
         if not folder_b.is_dir():
             log.error("CLI Swap: cartella B non valida: %s", folder_b)
-            print(f"  Errore: '{folder_b}' non è una cartella valida.")
+            print(f"  Errore: '{folder_b}' non e' una cartella valida.")
             return
         if folder_a.resolve() == folder_b.resolve():
             log.error("CLI Swap: cartelle identiche: %s", folder_a)

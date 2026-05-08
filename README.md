@@ -86,6 +86,20 @@ python main.py rename-folders "C:\Archivio" --execute
 python main.py setup --list
 ```
 
+L'output CLI usa marker testuali ASCII come `[INFO]`, `[MOVE]`, `[COPY]` e `[OK]`
+per restare compatibile anche con console Windows legacy.
+
+## Test automatici
+
+Per eseguire la verifica base:
+
+```cmd
+python -m unittest discover -s tests -v
+```
+
+I test coprono sanitizzazione path, marker progetto, rinomina cartelle sicura,
+dry-run non distruttivo e parser base della rinomina cartelle.
+
 ## Privacy
 
 - Nessun dato viene inviato a server esterni.
