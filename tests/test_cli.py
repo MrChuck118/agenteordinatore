@@ -70,6 +70,36 @@ class CliDryRunTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertTrue((root / "Amministrazione").is_dir())
 
+    def test_swap_uncertain_classification_does_not_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder_a = root / "A"
+            folder_b = root / "B"
+            folder_a.mkdir()
+            folder_b.mkdir()
+            source = folder_a / "incerto.txt"
+            source.write_text("demo", encoding="utf-8")
+
+            with patch("main.classify_for_swap", return_value=None):
+                with redirect_stdout(io.StringIO()) as out:
+                    main.swap(folder_a, folder_b, dry_run=False)
+
+            self.assertTrue(source.exists())
+            self.assertFalse((folder_b / "incerto.txt").exists())
+            self.assertIn("[INCERTO]", out.getvalue())
+
+    def test_nested_folder_selection_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "Parent"
+            child = parent / "Child"
+            child.mkdir(parents=True)
+
+            message = main._nested_folder_error([parent, child])
+
+            self.assertIsNotNone(message)
+            self.assertIn("annidate", message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QI
 from utils import (
     scan_folder, move_file, copy_file, format_size, sanitize_category,
     build_folder_profile, build_folder_profile_from_names, rename_folder_safe,
+    find_nested_folder_pair,
 )
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
@@ -707,7 +708,9 @@ class SwapAnalyzeWorker(QThread):
                     if _path_key(e["path"]) != target_key
                 ]
                 dest = classify_for_swap(fp.name, size_str, fa_name, fb_name, fa_sample, fb_filenames)
-                if dest is None or dest == "A":
+                if dest is None:
+                    dest_label = f"Incerto - resta in {fa_name}"
+                elif dest == "A":
                     dest_label = f"Resta in {fa_name}"
                 else:
                     dest_label = fb_name
@@ -727,7 +730,9 @@ class SwapAnalyzeWorker(QThread):
                     if _path_key(e["path"]) != target_key
                 ]
                 dest = classify_for_swap(fp.name, size_str, fa_name, fb_name, fa_filenames, fb_sample)
-                if dest is None or dest == "B":
+                if dest is None:
+                    dest_label = f"Incerto - resta in {fb_name}"
+                elif dest == "B":
                     dest_label = f"Resta in {fb_name}"
                 else:
                     dest_label = fa_name
@@ -850,8 +855,17 @@ class MultiSwapAnalyzeWorker(QThread):
                         target_path=target_path_str,
                     )
 
-                    stays = (dest_idx == origin_idx)
-                    if stays:
+                    if dest_idx is None:
+                        stays = True
+                        stayed_count += 1
+                        dest_idx = origin_idx
+                        dest_label = f"Incerto - resta in {origin_name}"
+                        log.debug(
+                            "MultiSwap: '%s' incerto, resta in '%s'",
+                            fp.name, origin_name,
+                        )
+                    elif dest_idx == origin_idx:
+                        stays = True
                         stayed_count += 1
                         dest_label = f"Resta in {origin_name}"
                         log.debug(
@@ -859,6 +873,7 @@ class MultiSwapAnalyzeWorker(QThread):
                             fp.name, origin_name,
                         )
                     else:
+                        stays = False
                         move_count += 1
                         dest_label = self.folders[dest_idx].name
 
@@ -1123,12 +1138,56 @@ def _check_model_ready(parent: QWidget) -> bool:
     return True
 
 
+_ACTIVE_AI_WORKER: QThread | None = None
+
+
+def _ai_analysis_running() -> bool:
+    global _ACTIVE_AI_WORKER
+    if _ACTIVE_AI_WORKER is not None and _ACTIVE_AI_WORKER.isRunning():
+        return True
+    _ACTIVE_AI_WORKER = None
+    return False
+
+
+def _clear_ai_worker(worker: QThread):
+    global _ACTIVE_AI_WORKER
+    if _ACTIVE_AI_WORKER is worker:
+        _ACTIVE_AI_WORKER = None
+
+
+def _guard_ai_analysis(parent: QWidget) -> bool:
+    if not _ai_analysis_running():
+        return True
+    message = "Attendi la fine dell'analisi AI gia' in corso."
+    status = getattr(parent, "status_label", None)
+    if status is not None:
+        status.setText(message)
+    QMessageBox.information(parent, "Analisi in corso", message)
+    return False
+
+
+def _register_ai_worker(worker: QThread):
+    global _ACTIVE_AI_WORKER
+    _ACTIVE_AI_WORKER = worker
+    worker.finished.connect(lambda *args, _worker=worker: _clear_ai_worker(_worker))
+    if hasattr(worker, "error"):
+        worker.error.connect(lambda *args, _worker=worker: _clear_ai_worker(_worker))
+
+
 def _path_key(path: Path) -> str:
     """Ritorna una chiave path stabile per confronti tra file/cartelle."""
     try:
         return str(path.resolve())
     except OSError:
         return str(path)
+
+
+def _nested_folder_message(folders: list[Path]) -> str | None:
+    pair = find_nested_folder_pair(folders)
+    if not pair:
+        return None
+    parent, child = pair
+    return f"Cartelle annidate non consentite: '{child}' e' dentro '{parent}'."
 
 
 def _set_item_colors(item: QTableWidgetItem, foreground: str, background: str | None = None):
@@ -1364,6 +1423,8 @@ class OrganizeTab(QWidget):
             return
         if self._worker is not None and self._worker.isRunning():
             return
+        if not _guard_ai_analysis(self):
+            return
         if not _check_model_ready(self):
             return
 
@@ -1380,6 +1441,7 @@ class OrganizeTab(QWidget):
         self.status_label.setText("Analisi in corso...")
 
         self._worker = OrganizeAnalyzeWorker(self._folder)
+        _register_ai_worker(self._worker)
         self._worker.progress.connect(self._on_analyze_progress)
         self._worker.finished.connect(self._on_analyze_finished)
         self._worker.error.connect(self._on_analyze_error)
@@ -1660,11 +1722,19 @@ class SwapTab(QWidget):
             return False
         return self._folder_a.resolve() == self._folder_b.resolve()
 
+    def _selected_folder_error(self) -> str | None:
+        if not self._folder_a or not self._folder_b:
+            return None
+        if self._same_selected_folders():
+            return "Le due cartelle devono essere diverse."
+        return _nested_folder_message([self._folder_a, self._folder_b])
+
     def _check_ready(self):
         ready = self._folder_a is not None and self._folder_b is not None
-        if ready and self._same_selected_folders():
+        error = self._selected_folder_error() if ready else None
+        if error:
             self.analyze_btn.setEnabled(False)
-            self.status_label.setText("Le due cartelle devono essere diverse.")
+            self.status_label.setText(error)
         else:
             self.analyze_btn.setEnabled(ready)
             self.status_label.setText("")
@@ -1742,7 +1812,11 @@ class SwapTab(QWidget):
         self.progress_bar.setVisible(True)
         self.status_label.setText("Analisi nomi cartelle post-swap...")
 
+        if not _guard_ai_analysis(self):
+            return
+
         self._rename_worker = ProjectedFolderRenameAnalyzeWorker(profiles)
+        _register_ai_worker(self._rename_worker)
         self._rename_worker.progress.connect(self._on_rename_analyze_progress)
         self._rename_worker.finished.connect(self._on_rename_analyze_finished)
         self._rename_worker.error.connect(self._on_rename_analyze_error)
@@ -1794,12 +1868,15 @@ class SwapTab(QWidget):
     def _start_analyze(self):
         if not self._folder_a or not self._folder_b:
             return
-        if self._same_selected_folders():
-            self.status_label.setText("Le due cartelle devono essere diverse.")
+        selected_error = self._selected_folder_error()
+        if selected_error:
+            self.status_label.setText(selected_error)
             return
         if self._worker is not None and self._worker.isRunning():
             return
         if self._rename_worker is not None and self._rename_worker.isRunning():
+            return
+        if not _guard_ai_analysis(self):
             return
         if not _check_model_ready(self):
             return
@@ -1817,6 +1894,7 @@ class SwapTab(QWidget):
         self.status_label.setText("Analisi scambio in corso...")
 
         self._worker = SwapAnalyzeWorker(self._folder_a, self._folder_b)
+        _register_ai_worker(self._worker)
         self._worker.progress.connect(self._on_analyze_progress)
         self._worker.finished.connect(self._on_analyze_finished)
         self._worker.error.connect(self._on_analyze_error)
@@ -1826,7 +1904,8 @@ class SwapTab(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
-        stays = dest_label.startswith("Resta in")
+        uncertain = dest_label.startswith("Incerto")
+        stays = dest_label.startswith("Resta in") or uncertain
 
         # Checkbox — disabilitata se resta
         chk = QTableWidgetItem()
@@ -1841,7 +1920,9 @@ class SwapTab(QWidget):
         items_data = [filename, size_str, current_folder, dest_label]
         for col, text in enumerate(items_data, start=1):
             ti = QTableWidgetItem(text)
-            if stays:
+            if uncertain:
+                _set_item_colors(ti, "#b88a2a")
+            elif stays:
                 _set_item_colors(ti, "#6a9a6a")
             self.table.setItem(row, col, ti)
 
@@ -1852,6 +1933,7 @@ class SwapTab(QWidget):
             "filename": filename,
             "origin": origin,
             "stays": stays,
+            "uncertain": uncertain,
             "dest_label": dest_label,
             "current_folder": current_folder,
         })
@@ -1861,9 +1943,12 @@ class SwapTab(QWidget):
         self._worker = None
         n = len(self._analyzed_items)
         to_move = sum(1 for it in self._analyzed_items if not it["stays"])
+        uncertain = sum(1 for it in self._analyzed_items if it.get("uncertain"))
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.status_label.setText(f"Analisi completata: {n} file analizzati, {to_move} da spostare.")
+        self.status_label.setText(
+            f"Analisi completata: {n} file analizzati, {to_move} da spostare, {uncertain} incerti."
+        )
         self.analyze_btn.setEnabled(True)
         self.execute_btn.setEnabled(to_move > 0)
         if self.rename_after_swap_chk.isChecked():
@@ -2256,9 +2341,13 @@ class MultiSwapTab(QWidget):
         # Rileva duplicati per status
         total_filled = sum(1 for s in self._slots if s.get_path())
         ready = len(valid) >= 2
+        nested_message = _nested_folder_message(valid) if ready else None
 
         if total_filled > len(valid):
             self.status_label.setText("Cartelle duplicate o non valide ignorate.")
+        elif nested_message:
+            ready = False
+            self.status_label.setText(nested_message)
         elif not ready:
             if total_filled < 2:
                 self.status_label.setText("Servono almeno 2 cartelle distinte.")
@@ -2350,7 +2439,11 @@ class MultiSwapTab(QWidget):
         self.progress_bar.setVisible(True)
         self.status_label.setText("Analisi nomi cartelle post-swap...")
 
+        if not _guard_ai_analysis(self):
+            return
+
         self._rename_worker = ProjectedFolderRenameAnalyzeWorker(profiles)
+        _register_ai_worker(self._rename_worker)
         self._rename_worker.progress.connect(self._on_rename_analyze_progress)
         self._rename_worker.finished.connect(self._on_rename_analyze_finished)
         self._rename_worker.error.connect(self._on_rename_analyze_error)
@@ -2405,9 +2498,15 @@ class MultiSwapTab(QWidget):
         valid = self._collect_valid_folders()
         if len(valid) < 2:
             return
+        nested_message = _nested_folder_message(valid)
+        if nested_message:
+            self.status_label.setText(nested_message)
+            return
         if self._worker is not None and self._worker.isRunning():
             return
         if self._rename_worker is not None and self._rename_worker.isRunning():
+            return
+        if not _guard_ai_analysis(self):
             return
         if not _check_model_ready(self):
             return
@@ -2429,6 +2528,7 @@ class MultiSwapTab(QWidget):
         self.status_label.setText("Analisi multi-swap in corso...")
 
         self._worker = MultiSwapAnalyzeWorker(self._folders)
+        _register_ai_worker(self._worker)
         self._worker.progress.connect(self._on_analyze_progress)
         self._worker.finished.connect(self._on_analyze_finished)
         self._worker.error.connect(self._on_analyze_error)
@@ -2441,6 +2541,7 @@ class MultiSwapTab(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
+        uncertain = dest_label.startswith("Incerto")
         chk = QTableWidgetItem()
         if stays:
             chk.setCheckState(Qt.Unchecked)
@@ -2450,11 +2551,13 @@ class MultiSwapTab(QWidget):
             chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
         self.table.setItem(row, 0, chk)
 
-        outcome = "Resta" if stays else "Da spostare"
+        outcome = "Incerto" if uncertain else ("Resta" if stays else "Da spostare")
         items_data = [filename, size_str, current_folder, dest_label, outcome]
         for col, text in enumerate(items_data, start=1):
             ti = QTableWidgetItem(text)
-            if stays:
+            if uncertain:
+                _set_item_colors(ti, "#b88a2a", None)
+            elif stays:
                 _set_item_colors(ti, "#7a7a7a", None)
             self.table.setItem(row, col, ti)
 
@@ -2464,6 +2567,7 @@ class MultiSwapTab(QWidget):
             "origin_idx": origin_idx,
             "dest_idx": dest_idx,
             "stays": stays,
+            "uncertain": uncertain,
             "current_folder": current_folder,
             "dest_label": dest_label,
         })
@@ -2473,10 +2577,11 @@ class MultiSwapTab(QWidget):
         self._worker = None
         n = len(self._analyzed_items)
         to_move = sum(1 for it in self._analyzed_items if not it["stays"])
+        uncertain = sum(1 for it in self._analyzed_items if it.get("uncertain"))
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.status_label.setText(
-            f"Analisi completata: {n} file analizzati, {to_move} da spostare."
+            f"Analisi completata: {n} file analizzati, {to_move} da spostare, {uncertain} incerti."
         )
         self.analyze_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
@@ -2712,6 +2817,8 @@ class FolderRenameTab(QWidget):
         if not is_folder_rename_allowed():
             self.status_label.setText("Rinomina cartelle disabilitata nelle Impostazioni.")
             return
+        if not _guard_ai_analysis(self):
+            return
         if not _check_model_ready(self):
             return
 
@@ -2730,6 +2837,7 @@ class FolderRenameTab(QWidget):
             self._root_folder,
             self.include_root_chk.isChecked(),
         )
+        _register_ai_worker(self._worker)
         self._worker.progress.connect(self._on_analyze_progress)
         self._worker.finished.connect(self._on_analyze_finished)
         self._worker.error.connect(self._on_analyze_error)
@@ -3179,6 +3287,15 @@ class SettingsTab(QWidget):
         return "standard"
 
     def _on_tier_changed(self, _btn):
+        if _ai_analysis_running():
+            self.dl_status.setText("Attendi la fine dell'analisi AI prima di cambiare modello.")
+            current = get_selected_tier()
+            radio = self._tier_radios.get(current)
+            if radio is not None:
+                self._tier_btn_group.blockSignals(True)
+                radio.setChecked(True)
+                self._tier_btn_group.blockSignals(False)
+            return
         tier = self._get_selected_tier_key()
         set_selected_tier(tier)
         # Scarica il modello precedente dalla memoria per liberare RAM
@@ -3186,6 +3303,13 @@ class SettingsTab(QWidget):
         self._update_download_buttons()
 
     def _on_gpu_toggle(self, state):
+        if _ai_analysis_running():
+            self.dl_status.setText("Attendi la fine dell'analisi AI prima di cambiare GPU/CPU.")
+            current = bool(load_config().get("gpu_offload", True))
+            self.gpu_checkbox.blockSignals(True)
+            self.gpu_checkbox.setChecked(current)
+            self.gpu_checkbox.blockSignals(False)
+            return
         config = load_config()
         config["gpu_offload"] = bool(state)
         save_config(config)
@@ -3328,6 +3452,9 @@ class SettingsTab(QWidget):
         self._update_download_buttons()
 
     def _delete_model(self):
+        if _ai_analysis_running():
+            self.dl_status.setText("Attendi la fine dell'analisi AI prima di eliminare un modello.")
+            return
         tier = self._get_selected_tier_key()
         if not is_model_downloaded(tier):
             return

@@ -176,6 +176,33 @@ def detect_project_markers(folder: Path) -> list[str]:
     return markers
 
 
+def find_nested_folder_pair(folders: list[Path]) -> tuple[Path, Path] | None:
+    """
+    Ritorna una coppia (parent, child) se due cartelle selezionate sono annidate.
+
+    Serve a bloccare swap/multiswap rischiosi tra una cartella e una sua
+    sottocartella, caso in cui i file potrebbero essere campionati/spostati in
+    modo confuso.
+    """
+    resolved: list[tuple[Path, Path]] = []
+    for folder in folders:
+        try:
+            resolved_path = folder.resolve()
+        except OSError:
+            resolved_path = folder.absolute()
+        resolved.append((folder, resolved_path))
+
+    for idx, (left_original, left_resolved) in enumerate(resolved):
+        for right_original, right_resolved in resolved[idx + 1:]:
+            if left_resolved == right_resolved:
+                continue
+            if right_resolved.is_relative_to(left_resolved):
+                return left_original, right_original
+            if left_resolved.is_relative_to(right_resolved):
+                return right_original, left_original
+    return None
+
+
 def build_folder_profile(folder: Path, sample_limit: int = 30) -> dict:
     """
     Costruisce un profilo leggero di una cartella per il suggerimento nome.

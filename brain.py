@@ -278,8 +278,8 @@ class LocalClassifier:
         return "Altro"
 
     @staticmethod
-    def _parse_swap(response_text: str) -> str:
-        """Estrae A o B dalla risposta."""
+    def _parse_swap(response_text: str) -> str | None:
+        """Estrae A o B dalla risposta. Ritorna None se la risposta e' incerta."""
         text = response_text.strip().upper()
         if text in ("A", "B"):
             return text
@@ -288,11 +288,11 @@ class LocalClassifier:
         if match:
             return match.group(1)
 
-        _log.warning("Parsing swap ambiguo, fallback 'A'. Risposta modello: %r", text[:200])
-        return "A"
+        _log.warning("Parsing swap ambiguo, classificazione incerta. Risposta modello: %r", text[:200])
+        return None
 
     @staticmethod
-    def _parse_index(response_text: str, valid_count: int) -> int:
+    def _parse_index(response_text: str, valid_count: int) -> int | None:
         """
         Estrae un indice intero dalla risposta del modello, con range check.
 
@@ -300,14 +300,14 @@ class LocalClassifier:
             1) int diretto del testo strip()
             2) regex \\b(\\d+)\\b sul testo
             3) range check: 0 <= idx < valid_count
-            4) fallback 0 con warning
+            4) None con warning se la risposta resta incerta
 
         Args:
             response_text: testo prodotto dal modello.
             valid_count: numero di opzioni proposte (es. len(folder_specs)).
 
         Returns:
-            Indice intero valido nell'intervallo [0, valid_count - 1].
+            Indice intero valido nell'intervallo [0, valid_count - 1], oppure None.
         """
         text = response_text.strip()
 
@@ -317,10 +317,10 @@ class LocalClassifier:
             if 0 <= idx < valid_count:
                 return idx
             _log.warning(
-                "Indice modello fuori range (got=%d, max=%d) - fallback a 0. Risposta: %r",
+                "Indice modello fuori range (got=%d, max=%d) - classificazione incerta. Risposta: %r",
                 idx, valid_count - 1, text[:200],
             )
-            return 0
+            return None
         except ValueError:
             pass
 
@@ -332,15 +332,15 @@ class LocalClassifier:
                 if 0 <= idx < valid_count:
                     return idx
                 _log.warning(
-                    "Indice modello fuori range (got=%d, max=%d) - fallback a 0. Risposta: %r",
+                    "Indice modello fuori range (got=%d, max=%d) - classificazione incerta. Risposta: %r",
                     idx, valid_count - 1, text[:200],
                 )
-                return 0
+                return None
             except ValueError:
                 pass
 
-        _log.warning("Parsing indice fallito - fallback a 0. Risposta modello: %r", text[:200])
-        return 0
+        _log.warning("Parsing indice fallito - classificazione incerta. Risposta modello: %r", text[:200])
+        return None
 
     @staticmethod
     def _parse_folder_rename(response_text: str, current_name: str) -> dict:
@@ -418,8 +418,8 @@ class LocalClassifier:
     def classify_for_swap(
         self, filename, file_size, folder_a_name, folder_b_name,
         folder_a_files, folder_b_files
-    ) -> str:
-        """Classifica per swap. Ritorna 'A' o 'B'."""
+    ) -> str | None:
+        """Classifica per swap. Ritorna 'A', 'B' o None se incerto."""
         self._ensure_loaded()
 
         if isinstance(file_size, int):
@@ -473,7 +473,7 @@ class LocalClassifier:
     def classify_best_of_n(
         self, filename: str, file_size,
         folder_specs: list[dict],
-    ) -> int:
+    ) -> int | None:
         """
         Singola chiamata K-aria: dato un file e una lista di K cartelle candidate,
         ritorna l'indice (0..K-1) della cartella scelta dal modello.
@@ -487,7 +487,7 @@ class LocalClassifier:
                 - "files": lista di nomi file campione (senza il file target)
 
         Returns:
-            Indice intero in [0, len(folder_specs) - 1].
+            Indice intero in [0, len(folder_specs) - 1], oppure None se incerto.
         """
         self._ensure_loaded()
 
@@ -523,6 +523,9 @@ class LocalClassifier:
         )
         result_text = response["choices"][0]["message"]["content"]
         idx = self._parse_index(result_text, len(folder_specs))
+        if idx is None:
+            _log.debug("classify_best_of_n: '%s' -> incerto", filename)
+            return None
         _log.debug(
             "classify_best_of_n: '%s' -> idx=%d (%s)",
             filename, idx, folder_specs[idx].get("name", "?"),
@@ -533,7 +536,7 @@ class LocalClassifier:
         self, filename: str, file_size,
         folder_specs: list[dict],
         target_path: str | None = None,
-    ) -> int:
+    ) -> int | None:
         """
         Decide la cartella di destinazione di un file tra N candidate, usando
         un torneo a chunk se N supera il chunk_size del tier.
@@ -548,7 +551,7 @@ class LocalClassifier:
 
         Returns:
             Indice intero in [0, len(folder_specs) - 1] della cartella scelta
-            nella lista ORIGINALE (non nei chunk).
+            nella lista ORIGINALE (non nei chunk), oppure None se incerto.
         """
         self._ensure_loaded()
 
@@ -567,6 +570,9 @@ class LocalClassifier:
                 filename, n,
             )
             winner = self.classify_best_of_n(filename, file_size, folder_specs)
+            if winner is None:
+                _log.debug("MultiSwap: '%s' -> incerto [1 call]", filename)
+                return None
             _log.debug(
                 "MultiSwap: '%s' -> idx=%d (%s) [1 call]",
                 filename, winner, folder_specs[winner].get("name", "?"),
@@ -596,6 +602,13 @@ class LocalClassifier:
                     continue
                 chunk_specs = [folder_specs[i] for i in chunk_orig]
                 local_winner = self.classify_best_of_n(filename, file_size, chunk_specs)
+                if local_winner is None:
+                    _log.debug(
+                        "Tournament round %d chunk %d/%d: %s -> incerto",
+                        round_num, ci + 1, chunks_count,
+                        [folder_specs[i].get("name", "?") for i in chunk_orig],
+                    )
+                    return None
                 total_calls += 1
                 orig_winner = chunk_orig[local_winner]
                 _log.debug(
@@ -719,8 +732,8 @@ def classify_file(filename: str, file_size="") -> str:
 def classify_for_swap(
     filename, file_size, folder_a_name, folder_b_name,
     folder_a_files, folder_b_files
-) -> str:
-    """Classifica per swap. Ritorna 'A' o 'B'."""
+) -> str | None:
+    """Classifica per swap. Ritorna 'A', 'B' o None se incerto."""
     global _classifier
     if _classifier is None:
         from config import get_selected_tier
@@ -735,10 +748,10 @@ def classify_for_multi_swap(
     filename: str, file_size,
     folder_specs: list[dict],
     target_path: str | None = None,
-) -> int:
+) -> int | None:
     """
     Wrapper modulo: ritorna l'indice della cartella scelta tra N candidate
-    usando il torneo a chunk del tier corrente.
+    usando il torneo a chunk del tier corrente, oppure None se incerto.
 
     `folder_specs` deve gia' contenere `files` privi del file target.
     """

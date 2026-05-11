@@ -5,6 +5,7 @@ from pathlib import Path
 from utils import (
     build_folder_profile,
     detect_project_markers,
+    find_nested_folder_pair,
     rename_folder_safe,
     sanitize_category,
     sanitize_folder_name,
@@ -48,6 +49,31 @@ class ProjectMarkerTests(unittest.TestCase):
             self.assertIn(".sln", markers)
             self.assertIn(".csproj", markers)
             self.assertTrue(build_folder_profile(folder)["protected"])
+
+
+class FolderSelectionSafetyTests(unittest.TestCase):
+    def test_detects_nested_folder_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "Archivio"
+            child = parent / "Sotto"
+            sibling = root / "Altro"
+            child.mkdir(parents=True)
+            sibling.mkdir()
+
+            pair = find_nested_folder_pair([sibling, child, parent])
+
+            self.assertEqual(pair, (parent, child))
+
+    def test_non_nested_folders_are_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            left = root / "A"
+            right = root / "B"
+            left.mkdir()
+            right.mkdir()
+
+            self.assertIsNone(find_nested_folder_pair([left, right]))
 
 
 class RenameFolderSafeTests(unittest.TestCase):

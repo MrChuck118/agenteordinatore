@@ -26,6 +26,7 @@ from pathlib import Path
 from utils import (
     scan_folder, move_file, copy_file, format_size, sanitize_category,
     build_folder_profile, build_folder_profile_from_names, rename_folder_safe,
+    find_nested_folder_pair,
 )
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
@@ -56,6 +57,17 @@ def _path_key(path: Path) -> str:
         return str(path.resolve())
     except OSError:
         return str(path)
+
+
+def _nested_folder_error(folders: list[Path]) -> str | None:
+    pair = find_nested_folder_pair(folders)
+    if not pair:
+        return None
+    parent, child = pair
+    return (
+        "  Errore: le cartelle non possono essere annidate "
+        f"('{child}' e' dentro '{parent}')."
+    )
 
 
 def _build_folder_specs(
@@ -265,6 +277,7 @@ def swap(
 
     moved_count = 0
     stayed_count = 0
+    uncertain_count = 0
 
     # 2. Classifica i file della cartella A
     for entry in files_a:
@@ -282,7 +295,10 @@ def swap(
             folder_a_sample, folder_b_filenames,
         )
 
-        if destination is None or destination == "A":
+        if destination is None:
+            print(f"  [INCERTO] {file_path.name}: nessuna destinazione sicura, resta in {folder_a_name}")
+            uncertain_count += 1
+        elif destination == "A":
             print(f"  [OK] {file_path.name}: {folder_a_name} -> resta in {folder_a_name}")
             stayed_count += 1
         else:
@@ -311,7 +327,10 @@ def swap(
             folder_a_filenames, folder_b_sample,
         )
 
-        if destination is None or destination == "B":
+        if destination is None:
+            print(f"  [INCERTO] {file_path.name}: nessuna destinazione sicura, resta in {folder_b_name}")
+            uncertain_count += 1
+        elif destination == "B":
             print(f"  [OK] {file_path.name}: {folder_b_name} -> resta in {folder_b_name}")
             stayed_count += 1
         else:
@@ -333,12 +352,13 @@ def swap(
             dry_run,
         )
 
-    log.info("CLI Swap completato: %d analizzati, %d spostati, %d restano",
-             total, moved_count, stayed_count)
+    log.info("CLI Swap completato: %d analizzati, %d spostati, %d restano, %d incerti",
+             total, moved_count, stayed_count, uncertain_count)
     print(f"\n{'=' * 60}")
     print(f"  Riepilogo: {total} file analizzati.")
     print(f"    Da spostare: {moved_count}")
     print(f"    Gia' al posto giusto: {stayed_count}")
+    print(f"    Incerti: {uncertain_count}")
     if rename_after:
         print(f"    Cartelle rinominate: {len(renamed)}")
 
@@ -396,6 +416,7 @@ def multiswap(
     moved_count = 0
     stayed_count = 0
     failed_count = 0
+    uncertain_count = 0
 
     for origin_idx, files in enumerate(all_files):
         origin_folder = folders[origin_idx]
@@ -414,6 +435,11 @@ def multiswap(
                 failed_count += 1
                 log.exception("CLI MultiSwap: classificazione fallita per %s", file_path)
                 print(f"  [ERRORE] {file_path.name}: classificazione fallita ({exc})")
+                continue
+
+            if dest_idx is None:
+                uncertain_count += 1
+                print(f"  [INCERTO] {file_path.name}: nessuna destinazione sicura, resta in {origin_name}")
                 continue
 
             if not (0 <= dest_idx < len(folders)):
@@ -450,13 +476,14 @@ def multiswap(
         renamed = _handle_projected_folder_renames(folders, projected_names, dry_run)
 
     log.info(
-        "CLI MultiSwap completato: %d analizzati, %d spostati, %d restano, %d errori",
-        total, moved_count, stayed_count, failed_count,
+        "CLI MultiSwap completato: %d analizzati, %d spostati, %d restano, %d incerti, %d errori",
+        total, moved_count, stayed_count, uncertain_count, failed_count,
     )
     print(f"\n{'=' * 60}")
     print(f"  Riepilogo: {total} file analizzati.")
     print(f"    Da spostare: {moved_count}")
     print(f"    Gia' al posto giusto: {stayed_count}")
+    print(f"    Incerti: {uncertain_count}")
     print(f"    Errori: {failed_count}")
     if rename_after:
         print(f"    Cartelle rinominate: {len(renamed)}")
@@ -790,6 +817,11 @@ def main() -> None:
             log.error("CLI Swap: cartelle identiche: %s", folder_a)
             print("  Errore: le due cartelle devono essere diverse.")
             return
+        nested_error = _nested_folder_error([folder_a, folder_b])
+        if nested_error:
+            log.error("CLI Swap: cartelle annidate: %s / %s", folder_a, folder_b)
+            print(nested_error)
+            return
         tier = args.tier or get_selected_tier()
         if not _ensure_model(tier):
             return
@@ -820,6 +852,12 @@ def main() -> None:
                 print("  Errore: le cartelle devono essere distinte.")
                 return
             resolved_seen.add(key)
+
+        nested_error = _nested_folder_error(folders)
+        if nested_error:
+            log.error("CLI MultiSwap: cartelle annidate: %s", folders)
+            print(nested_error)
+            return
 
         tier = args.tier or get_selected_tier()
         if not _ensure_model(tier):
