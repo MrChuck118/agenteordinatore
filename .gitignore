@@ -6,6 +6,7 @@
 
 # ── Ambiente virtuale Python ──────────────────────────────────────
 .venv/
+.venv-build/
 venv/
 env/
 

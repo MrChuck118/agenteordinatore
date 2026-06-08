@@ -10,9 +10,12 @@ Questo progetto supporta una distribuzione Windows in 3 livelli:
 
 - Windows 10 o 11.
 - Python compatibile installato sul PC di build.
-- Dipendenze installate nel Python utente con `install.bat` senza `.venv`.
-- Connessione Internet al primo build per installare `pyinstaller`.
+- Connessione Internet al primo build per installare le dipendenze in `.venv-build`.
 - Inno Setup 6 solo se vuoi creare anche l'installer `.exe`.
+
+Nota: `build_exe.bat` crea e usa un ambiente isolato `.venv-build`. Non usa il
+Python utente per PyInstaller, cosi' evita di includere pacchetti estranei
+installati globalmente.
 
 ## 1. Build portable
 
@@ -33,6 +36,10 @@ dist/
 ```
 
 Questa cartella e' portable: puoi copiarla su un altro PC Windows compatibile e avviare `Agent Ordinatore.exe`.
+
+La build portable usa `PySide6-Essentials` e una lista di exclude PyInstaller per
+tenere fuori librerie non usate come `django`, `pandas`, `scipy`, `pyarrow`,
+`boto3`, `botocore`, `fastapi`, `starlette`, `torch`, `tensorflow` e Qt WebEngine.
 
 ## 2. Installer Windows
 
@@ -73,5 +80,6 @@ Questo evita pacchetti enormi e permette di scaricare solo il tier scelto dall'u
 ## Note
 
 - Usa PyInstaller in modalita' `onedir`, non `onefile`, per ridurre falsi positivi antivirus e tempi di avvio.
+- Non cancellare `.venv-build` se vuoi rebuild piu' rapidi; puoi eliminarla manualmente solo per forzare una build da ambiente nuovo.
 - Non distribuire `history.json`, log, cache HuggingFace o modelli scaricati.
 - Per un rilascio pubblico conviene firmare sia `Agent Ordinatore.exe` sia l'installer.

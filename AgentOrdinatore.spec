@@ -5,7 +5,6 @@ from pathlib import Path
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
-    collect_submodules,
 )
 
 
@@ -23,21 +22,41 @@ datas += collect_data_files("llama_cpp", includes=["py.typed"])
 
 hiddenimports = [
     "huggingface_hub",
+    "llama_cpp",
     "platformdirs",
     "psutil",
-    "PIL",
 ]
-hiddenimports += collect_submodules("llama_cpp")
 
 excludes = [
     "anthropic",
+    "boto3",
+    "botocore",
+    "cv2",
+    "django",
+    "fastapi",
     "IPython",
     "jupyter",
+    "llama_cpp.server",
     "matplotlib",
     "notebook",
+    "pandas",
+    "PIL",
+    "pyarrow",
+    "pydantic",
     "pytest",
+    "scipy",
+    "seaborn",
+    "sklearn",
+    "starlette",
+    "tensorflow",
     "tkinter",
+    "torch",
+    "uvicorn",
     "unittest",
+    "PySide6.QtWebChannel",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineQuick",
+    "PySide6.QtWebEngineWidgets",
 ]
 
 

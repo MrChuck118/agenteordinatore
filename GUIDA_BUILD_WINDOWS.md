@@ -42,6 +42,9 @@ install.bat
 
 Nota importante: il progetto non richiede piu' `.venv`. `install.bat` usa il
 Python utente installato sul sistema e installa le dipendenze con `pip --user`.
+La build portable invece usa un ambiente dedicato `.venv-build`, creato
+automaticamente da `build_exe.bat`, per evitare che PyInstaller includa librerie
+estranee presenti nel Python utente.
 
 ## Prerequisiti sul PC di casa
 
@@ -98,10 +101,15 @@ build_exe.bat
 
 Cosa fa:
 
-- installa gli strumenti di build da `build_requirements.txt`;
+- crea o riusa `.venv-build`;
+- installa in `.venv-build` le dipendenze runtime da `requirements.txt`;
+- installa in `.venv-build` gli strumenti da `build_requirements.txt`;
+- installa in `.venv-build` `llama-cpp-python` CPU per massima portabilita';
 - usa PyInstaller con `AgentOrdinatore.spec`;
 - crea una build `onedir`, non `onefile`;
-- include PySide6, llama-cpp-python e dipendenze native;
+- include PySide6-Essentials, llama-cpp-python e dipendenze native;
+- esclude librerie non usate come `django`, `pandas`, `scipy`, `pyarrow`,
+  `boto3`, `botocore`, `fastapi`, `starlette`, `torch`, `tensorflow` e Qt WebEngine;
 - non include i modelli `.gguf`.
 
 Output atteso:
@@ -213,6 +221,7 @@ Non distribuire:
 
 ```text
 build\
+.venv-build\
 history.json
 *.log
 .cache\
@@ -282,6 +291,7 @@ La strategia scelta e':
 - PyInstaller `onedir`, non `onefile`;
 - entry point GUI: `gui.py`;
 - file spec: `AgentOrdinatore.spec`;
+- ambiente build isolato: `.venv-build`;
 - exe finale: `dist\Agent Ordinatore\Agent Ordinatore.exe`;
 - installer: Inno Setup con `installer\AgentOrdinatore.iss`;
 - modelli AI esterni al pacchetto in `%LOCALAPPDATA%\AgentOrdinatore\models`.
@@ -298,4 +308,5 @@ Ultimo stato verificato:
 - sintassi Python e `.spec` compilano;
 - `build_exe.bat` e' pronto;
 - `build_installer.bat` e' pronto;
-- il flusso corrente usa Python utente senza `.venv`.
+- il flusso sorgente usa Python utente senza `.venv`;
+- il flusso build usa `.venv-build` isolato.
