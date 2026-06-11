@@ -1,6 +1,6 @@
 # Specifica Tecnica - Agent Ordinatore
 
-Ultimo aggiornamento: 2026-06-08
+Ultimo aggiornamento: 2026-06-11
 
 ## Scopo
 
@@ -22,8 +22,8 @@ cartella dati utente.
 
 ## Moduli principali
 
-- `gui.py`: interfaccia desktop PySide6, tab operativi, cronologia, impostazioni,
-  download modelli e avvio delle operazioni in thread.
+- `gui.py`: interfaccia desktop PySide6, tab operativi, File Explorer, Logs,
+  impostazioni, download modelli e avvio/interruzione delle operazioni in thread.
 - `main.py`: interfaccia CLI con comandi `organize`, `swap`, `multiswap`,
   `rename-folders` e `setup`.
 - `brain.py`: prompt, parsing delle risposte del modello, classificazione file,
@@ -112,6 +112,28 @@ per chunk, context window e campionamento sono definite in `brain.py`.
 3. Sanitizzazione del nome suggerito.
 4. Anteprima o esecuzione con gestione conflitti.
 
+### File Explorer
+
+1. Tab dedicato `File Explorer`.
+2. Navigazione non distruttiva del filesystem tramite `QFileSystemModel` e
+   `QTreeView`.
+3. Root iniziale su `C:\` quando disponibile.
+4. Scelta della root con pulsanti drive, `Home`, `Desktop`, `Downloads`,
+   `Sfoglia` e `Aggiorna`.
+5. Checkbox `Mostra nascosti e sistema`, basata sui flag Qt `QDir.Hidden` e
+   `QDir.System`.
+6. Indicatore permessi `standard` o `amministratore`.
+7. Pulsante `Riavvia come amministratore`, che usa UAC su Windows.
+8. Messaggi di accesso limitato per cartelle non leggibili.
+9. Apertura di file o cartelle con l'applicazione di sistema.
+10. Invio della cartella selezionata al flusso `Organizza`.
+
+### Logs
+
+La tab precedentemente chiamata Cronologia e' esposta all'utente come `Logs`.
+Continua a leggere e scrivere `history.json` per compatibilita' con i dati
+esistenti, ma l'interfaccia mostra log operativi e dettaglio file/cartelle.
+
 ## Sicurezza operativa
 
 - Le modalita' principali partono in dry-run.
@@ -120,6 +142,14 @@ per chunk, context window e campionamento sono definite in `brain.py`.
 - Le cartelle annidate vengono rifiutate nei flussi di swap.
 - Le rinomine usano funzioni dedicate con risoluzione conflitti.
 - I log tracciano spostamenti, copie e rinomine.
+- Le analisi GUI espongono un pulsante `Interrompi` che invia
+  `requestInterruption()` ai worker attivi.
+- L'interruzione e' cooperativa: avviene tra uno step e il successivo o appena
+  termina una chiamata AI gia' in corso.
+- Il File Explorer e' non distruttivo: non espone cancellazione, spostamento o
+  rinomina manuale di file.
+- Anche con permessi amministratore, alcune cartelle possono restare non
+  leggibili se Windows o ACL speciali ne bloccano l'accesso.
 
 ## Privacy
 

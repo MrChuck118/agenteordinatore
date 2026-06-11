@@ -21,7 +21,9 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _libs_log
 
+import ctypes
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -35,9 +37,9 @@ from PySide6.QtWidgets import (  # type: ignore
     QLabel, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
     QProgressBar, QRadioButton, QButtonGroup, QHeaderView, QAbstractItemView,
     QMessageBox, QTreeWidget, QTreeWidgetItem, QSizePolicy, QLineEdit,
-    QCheckBox, QGroupBox,
+    QCheckBox, QGroupBox, QFileSystemModel, QTreeView,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QTimer, QUrl  # type: ignore
+from PySide6.QtCore import Qt, Signal, QThread, QTimer, QUrl, QDir  # type: ignore
 from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QDesktopServices  # type: ignore
 
 from utils import (
@@ -1174,6 +1176,45 @@ def _register_ai_worker(worker: QThread):
         worker.error.connect(lambda *args, _worker=worker: _clear_ai_worker(_worker))
 
 
+def _request_worker_interruption(worker: QThread | None, status_label: QLabel | None = None) -> bool:
+    if worker is not None and worker.isRunning():
+        worker.requestInterruption()
+        if status_label is not None:
+            status_label.setText("Interruzione richiesta...")
+        return True
+    return False
+
+
+def _is_running_as_admin() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        if getattr(sys, "frozen", False):
+            target = sys.executable
+            params = ""
+            workdir = str(Path(sys.executable).parent)
+        else:
+            target = sys.executable
+            params = f'"{Path(__file__).resolve()}"'
+            workdir = str(Path(__file__).resolve().parent)
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", target, params, workdir, 1
+        )
+        return int(result) > 32
+    except Exception:
+        log.exception("Riavvio come amministratore fallito")
+        return False
+
+
 def _path_key(path: Path) -> str:
     """Ritorna una chiave path stabile per confronti tra file/cartelle."""
     try:
@@ -1317,6 +1358,7 @@ class OrganizeTab(QWidget):
         super().__init__()
         self._worker = None
         self._exec_worker = None
+        self._cancel_requested = False
         self._analyzed_items: list[dict] = []
         self._folder: Path | None = None
         self._init_ui()
@@ -1388,12 +1430,26 @@ class OrganizeTab(QWidget):
         self.status_label.setObjectName("statusLabel")
         bottom_layout.addWidget(self.status_label, stretch=1)
 
+        self.cancel_btn = QPushButton("Interrompi")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_current_operation)
+        bottom_layout.addWidget(self.cancel_btn)
+
         self.execute_btn = QPushButton("Esegui")
         self.execute_btn.setObjectName("accentBtn")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._start_execute)
         bottom_layout.addWidget(self.execute_btn)
         layout.addLayout(bottom_layout)
+
+    def _cancel_current_operation(self):
+        self._cancel_requested = True
+        stopped = (
+            _request_worker_interruption(self._worker, self.status_label)
+            or _request_worker_interruption(self._exec_worker, self.status_label)
+        )
+        if stopped:
+            self.cancel_btn.setEnabled(False)
 
     def _set_folder(self, path: str):
         self._folder = Path(path)
@@ -1436,6 +1492,8 @@ class OrganizeTab(QWidget):
         self._analyzed_items.clear()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # indeterminata
         self.status_label.setText("Analisi in corso...")
@@ -1474,14 +1532,26 @@ class OrganizeTab(QWidget):
         n = len(self._analyzed_items)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.status_label.setText(f"Analisi completata: {n} file classificati.")
+        if self._cancel_requested:
+            self.status_label.setText(f"Analisi interrotta: {n} risultati parziali disponibili.")
+        else:
+            self.status_label.setText(f"Analisi completata: {n} file classificati.")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.execute_btn.setEnabled(n > 0)
 
     def _on_analyze_error(self, msg):
         self._worker = None
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Errore: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            n = len(self._analyzed_items)
+            self.status_label.setText(f"Analisi interrotta: {n} risultati parziali disponibili.")
+            self.execute_btn.setEnabled(n > 0)
+        else:
+            self.status_label.setText(f"Errore: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
 
     def _start_execute(self):
@@ -1500,6 +1570,8 @@ class OrganizeTab(QWidget):
         use_copy = self.radio_copy.isChecked()
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setRange(0, len(selected))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
@@ -1525,7 +1597,12 @@ class OrganizeTab(QWidget):
     def _on_exec_finished(self, count, selected, use_copy):
         self._exec_worker = None
         action = "copiati" if use_copy else "spostati"
-        self.status_label.setText(f"Completato! {count} file {action}.")
+        if self._cancel_requested:
+            self.status_label.setText(f"Operazione interrotta: {count} file {action}.")
+        else:
+            self.status_label.setText(f"Completato! {count} file {action}.")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, max(count, 1))
@@ -1564,6 +1641,7 @@ class SwapTab(QWidget):
         self._worker = None
         self._exec_worker = None
         self._rename_worker = None
+        self._cancel_requested = False
         self._analyzed_items: list[dict] = []
         self._rename_items: list[dict] = []
         self._folder_a: Path | None = None
@@ -1695,12 +1773,26 @@ class SwapTab(QWidget):
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
         bottom.addWidget(self.status_label, stretch=1)
+        self.cancel_btn = QPushButton("Interrompi")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_current_operation)
+        bottom.addWidget(self.cancel_btn)
         self.execute_btn = QPushButton("Esegui")
         self.execute_btn.setObjectName("accentBtn")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._start_execute)
         bottom.addWidget(self.execute_btn)
         layout.addLayout(bottom)
+
+    def _cancel_current_operation(self):
+        self._cancel_requested = True
+        stopped = (
+            _request_worker_interruption(self._worker, self.status_label)
+            or _request_worker_interruption(self._rename_worker, self.status_label)
+            or _request_worker_interruption(self._exec_worker, self.status_label)
+        )
+        if stopped:
+            self.cancel_btn.setEnabled(False)
 
     def _set_folder(self, which, path):
         p = Path(path)
@@ -1808,6 +1900,8 @@ class SwapTab(QWidget):
         self.rename_table.setVisible(True)
         self.rename_label.setVisible(True)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
         self.status_label.setText("Analisi nomi cartelle post-swap...")
@@ -1837,10 +1931,17 @@ class SwapTab(QWidget):
         to_rename = sum(1 for item in self._rename_items if item["action"] == "rename")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.status_label.setText(
-            f"Analisi completata: {len(self._analyzed_items)} file, "
-            f"{to_move} da spostare, {to_rename} rinomine proposte."
-        )
+        if self._cancel_requested:
+            self.status_label.setText(
+                f"Analisi nomi interrotta: {to_rename} rinomine parziali proposte."
+            )
+        else:
+            self.status_label.setText(
+                f"Analisi completata: {len(self._analyzed_items)} file, "
+                f"{to_move} da spostare, {to_rename} rinomine proposte."
+            )
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.execute_btn.setEnabled(to_move > 0 or to_rename > 0)
 
     def _on_rename_analyze_error(self, msg):
@@ -1849,7 +1950,12 @@ class SwapTab(QWidget):
         self.progress_bar.setValue(100)
         to_move = sum(1 for item in self._analyzed_items if not item["stays"])
         self.execute_btn.setEnabled(to_move > 0)
-        self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            self.status_label.setText("Analisi nomi cartelle interrotta.")
+        else:
+            self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
 
     def _apply_renamed_folder_paths(self, renamed: list[dict]):
         for item in renamed:
@@ -1889,6 +1995,8 @@ class SwapTab(QWidget):
         self._clear_rename_preview()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Analisi scambio in corso...")
@@ -1949,6 +2057,8 @@ class SwapTab(QWidget):
         self.status_label.setText(
             f"Analisi completata: {n} file analizzati, {to_move} da spostare, {uncertain} incerti."
         )
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.execute_btn.setEnabled(to_move > 0)
         if self.rename_after_swap_chk.isChecked():
@@ -1957,7 +2067,14 @@ class SwapTab(QWidget):
     def _on_analyze_error(self, msg):
         self._worker = None
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Errore: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            n = len(self._analyzed_items)
+            self.status_label.setText(f"Analisi interrotta: {n} risultati parziali disponibili.")
+            self.execute_btn.setEnabled(any(not item["stays"] for item in self._analyzed_items))
+        else:
+            self.status_label.setText(f"Errore: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
 
     def _start_execute(self):
@@ -1979,6 +2096,8 @@ class SwapTab(QWidget):
 
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setRange(0, max(len(selected), 1))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
@@ -2013,6 +2132,7 @@ class SwapTab(QWidget):
         self._exec_worker = None
         action = "copiati" if use_copy else "spostati"
         self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, max(count, 1))
         self.progress_bar.setValue(self.progress_bar.maximum())
@@ -2029,7 +2149,11 @@ class SwapTab(QWidget):
         rename_count = len(renamed)
         self._apply_renamed_folder_paths(renamed)
         rename_text = f", {rename_count} cartelle rinominate" if rename_count else ""
-        self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+        if self._cancel_requested:
+            self.status_label.setText(f"Operazione interrotta: {count} file {action}{rename_text}.")
+        else:
+            self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+        self._cancel_requested = False
 
         file_details = [
             {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
@@ -2143,6 +2267,7 @@ class MultiSwapTab(QWidget):
         self._worker: MultiSwapAnalyzeWorker | None = None
         self._exec_worker: MultiSwapExecuteWorker | None = None
         self._rename_worker: ProjectedFolderRenameAnalyzeWorker | None = None
+        self._cancel_requested = False
         self._slots: list[FolderSlot] = []
         self._analyzed_items: list[dict] = []
         self._rename_items: list[dict] = []
@@ -2266,12 +2391,26 @@ class MultiSwapTab(QWidget):
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
         bottom.addWidget(self.status_label, stretch=1)
+        self.cancel_btn = QPushButton("Interrompi")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_current_operation)
+        bottom.addWidget(self.cancel_btn)
         self.execute_btn = QPushButton("Esegui")
         self.execute_btn.setObjectName("accentBtn")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._start_execute)
         bottom.addWidget(self.execute_btn)
         layout.addLayout(bottom)
+
+    def _cancel_current_operation(self):
+        self._cancel_requested = True
+        stopped = (
+            _request_worker_interruption(self._worker, self.status_label)
+            or _request_worker_interruption(self._rename_worker, self.status_label)
+            or _request_worker_interruption(self._exec_worker, self.status_label)
+        )
+        if stopped:
+            self.cancel_btn.setEnabled(False)
 
     # ── Gestione slot dinamici ──────────────────────────────────────
 
@@ -2435,6 +2574,8 @@ class MultiSwapTab(QWidget):
         self.rename_table.setVisible(True)
         self.rename_label.setVisible(True)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
         self.status_label.setText("Analisi nomi cartelle post-swap...")
@@ -2464,10 +2605,17 @@ class MultiSwapTab(QWidget):
         to_rename = sum(1 for item in self._rename_items if item["action"] == "rename")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.status_label.setText(
-            f"Analisi completata: {len(self._analyzed_items)} file, "
-            f"{to_move} da spostare, {to_rename} rinomine proposte."
-        )
+        if self._cancel_requested:
+            self.status_label.setText(
+                f"Analisi nomi interrotta: {to_rename} rinomine parziali proposte."
+            )
+        else:
+            self.status_label.setText(
+                f"Analisi completata: {len(self._analyzed_items)} file, "
+                f"{to_move} da spostare, {to_rename} rinomine proposte."
+            )
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.execute_btn.setEnabled(to_move > 0 or to_rename > 0)
 
     def _on_rename_analyze_error(self, msg):
@@ -2476,7 +2624,12 @@ class MultiSwapTab(QWidget):
         self.progress_bar.setValue(100)
         to_move = sum(1 for item in self._analyzed_items if not item["stays"])
         self.execute_btn.setEnabled(to_move > 0)
-        self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            self.status_label.setText("Analisi nomi cartelle interrotta.")
+        else:
+            self.status_label.setText(f"Analisi file completata, rinomina non disponibile: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
 
     def _apply_renamed_folder_paths(self, renamed: list[dict]):
         for item in renamed:
@@ -2520,6 +2673,8 @@ class MultiSwapTab(QWidget):
         self._clear_rename_preview()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.add_btn.setEnabled(False)
         for slot in self._slots:
             slot.setEnabled(False)
@@ -2583,6 +2738,8 @@ class MultiSwapTab(QWidget):
         self.status_label.setText(
             f"Analisi completata: {n} file analizzati, {to_move} da spostare, {uncertain} incerti."
         )
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         for slot in self._slots:
@@ -2594,7 +2751,14 @@ class MultiSwapTab(QWidget):
     def _on_analyze_error(self, msg):
         self._worker = None
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Errore: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            n = len(self._analyzed_items)
+            self.status_label.setText(f"Analisi interrotta: {n} risultati parziali disponibili.")
+            self.execute_btn.setEnabled(any(not item["stays"] for item in self._analyzed_items))
+        else:
+            self.status_label.setText(f"Errore: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         for slot in self._slots:
@@ -2621,6 +2785,8 @@ class MultiSwapTab(QWidget):
 
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.add_btn.setEnabled(False)
         for slot in self._slots:
             slot.setEnabled(False)
@@ -2658,6 +2824,7 @@ class MultiSwapTab(QWidget):
         self._exec_worker = None
         action = "copiati" if use_copy else "spostati"
         self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         self.add_btn.setEnabled(True)
         for slot in self._slots:
             slot.setEnabled(True)
@@ -2675,7 +2842,11 @@ class MultiSwapTab(QWidget):
         rename_count = len(renamed)
         self._apply_renamed_folder_paths(renamed)
         rename_text = f", {rename_count} cartelle rinominate" if rename_count else ""
-        self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+        if self._cancel_requested:
+            self.status_label.setText(f"Operazione interrotta: {count} file {action}{rename_text}.")
+        else:
+            self.status_label.setText(f"Completato! {count} file {action}{rename_text}.")
+        self._cancel_requested = False
 
         file_details = [
             {"file": s["filename"], "from": s["current_folder"], "to": s["dest_label"]}
@@ -2715,6 +2886,7 @@ class FolderRenameTab(QWidget):
         super().__init__()
         self._worker = None
         self._exec_worker = None
+        self._cancel_requested = False
         self._root_folder: Path | None = None
         self._analyzed_items: list[dict] = []
         self._init_ui()
@@ -2779,12 +2951,26 @@ class FolderRenameTab(QWidget):
         self.status_label.setObjectName("statusLabel")
         bottom.addWidget(self.status_label, stretch=1)
 
+        self.cancel_btn = QPushButton("Interrompi")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_current_operation)
+        bottom.addWidget(self.cancel_btn)
+
         self.execute_btn = QPushButton("Rinomina")
         self.execute_btn.setObjectName("accentBtn")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._start_execute)
         bottom.addWidget(self.execute_btn)
         layout.addLayout(bottom)
+
+    def _cancel_current_operation(self):
+        self._cancel_requested = True
+        stopped = (
+            _request_worker_interruption(self._worker, self.status_label)
+            or _request_worker_interruption(self._exec_worker, self.status_label)
+        )
+        if stopped:
+            self.cancel_btn.setEnabled(False)
 
     def _set_folder(self, path: str):
         self._root_folder = Path(path)
@@ -2827,6 +3013,8 @@ class FolderRenameTab(QWidget):
         self._analyzed_items.clear()
         self.analyze_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.browse_btn.setEnabled(False)
         self.include_root_chk.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -2891,9 +3079,16 @@ class FolderRenameTab(QWidget):
         to_rename = sum(1 for item in self._analyzed_items if item["action"] == "rename")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.status_label.setText(
-            f"Analisi completata: {n} cartelle analizzate, {to_rename} rinomine proposte."
-        )
+        if self._cancel_requested:
+            self.status_label.setText(
+                f"Analisi interrotta: {n} risultati parziali, {to_rename} rinomine proposte."
+            )
+        else:
+            self.status_label.setText(
+                f"Analisi completata: {n} cartelle analizzate, {to_rename} rinomine proposte."
+            )
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
         self.include_root_chk.setEnabled(True)
@@ -2902,7 +3097,17 @@ class FolderRenameTab(QWidget):
     def _on_analyze_error(self, msg):
         self._worker = None
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Errore: {msg}")
+        if self._cancel_requested or msg == "Operazione interrotta.":
+            n = len(self._analyzed_items)
+            to_rename = sum(1 for item in self._analyzed_items if item["action"] == "rename")
+            self.status_label.setText(
+                f"Analisi interrotta: {n} risultati parziali, {to_rename} rinomine proposte."
+            )
+            self.execute_btn.setEnabled(to_rename > 0)
+        else:
+            self.status_label.setText(f"Errore: {msg}")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
         self.include_root_chk.setEnabled(True)
@@ -2928,6 +3133,8 @@ class FolderRenameTab(QWidget):
 
         self.execute_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_requested = False
         self.browse_btn.setEnabled(False)
         self.include_root_chk.setEnabled(False)
         self.progress_bar.setRange(0, len(selected))
@@ -2951,7 +3158,12 @@ class FolderRenameTab(QWidget):
 
     def _on_exec_finished(self, count, selected):
         self._exec_worker = None
-        self.status_label.setText(f"Completato! {count} cartelle rinominate.")
+        if self._cancel_requested:
+            self.status_label.setText(f"Operazione interrotta: {count} cartelle rinominate.")
+        else:
+            self.status_label.setText(f"Completato! {count} cartelle rinominate.")
+        self._cancel_requested = False
+        self.cancel_btn.setEnabled(False)
         self.analyze_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
         self.include_root_chk.setEnabled(True)
@@ -3001,7 +3213,7 @@ class HistoryTab(QWidget):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.clear_btn = QPushButton("Cancella cronologia")
+        self.clear_btn = QPushButton("Cancella logs")
         self.clear_btn.clicked.connect(self._clear_history)
         btn_layout.addWidget(self.clear_btn)
         layout.addLayout(btn_layout)
@@ -3050,7 +3262,7 @@ class HistoryTab(QWidget):
     def _clear_history(self):
         reply = QMessageBox.question(
             self, "Conferma",
-            "Cancellare tutta la cronologia?",
+            "Cancellare tutti i logs?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
@@ -3475,6 +3687,225 @@ class SettingsTab(QWidget):
 
 # ── Finestra principale ───────────────────────────────────────────────
 
+class FileExplorerTab(QWidget):
+    """Explorer non distruttivo per navigare e selezionare cartelle."""
+    folder_selected_for_organize = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._init_ui()
+        self._set_root(self._default_root())
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        path_row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setReadOnly(True)
+        path_row.addWidget(self.path_edit, stretch=1)
+
+        self.home_btn = QPushButton("Home")
+        self.home_btn.clicked.connect(lambda: self._set_root(Path.home()))
+        path_row.addWidget(self.home_btn)
+
+        self.browse_btn = QPushButton("Sfoglia")
+        self.browse_btn.clicked.connect(self._browse_root)
+        path_row.addWidget(self.browse_btn)
+
+        self.refresh_btn = QPushButton("Aggiorna")
+        self.refresh_btn.clicked.connect(self._refresh)
+        path_row.addWidget(self.refresh_btn)
+        layout.addLayout(path_row)
+
+        quick_row = QHBoxLayout()
+        self.admin_label = QLabel(self._admin_status_text())
+        self.admin_label.setObjectName("statusLabel")
+        quick_row.addWidget(self.admin_label)
+
+        self.admin_btn = QPushButton("Riavvia come amministratore")
+        self.admin_btn.setEnabled(not _is_running_as_admin())
+        self.admin_btn.clicked.connect(self._restart_as_admin)
+        quick_row.addWidget(self.admin_btn)
+
+        quick_row.addStretch()
+        layout.addLayout(quick_row)
+
+        roots_row = QHBoxLayout()
+        for drive_path in self._drive_paths():
+            button = QPushButton(drive_path)
+            button.clicked.connect(lambda _checked=False, p=drive_path: self._set_root(Path(p)))
+            roots_row.addWidget(button)
+
+        for label, folder in self._quick_folders():
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, p=folder: self._set_root(p))
+            roots_row.addWidget(button)
+
+        roots_row.addStretch()
+        layout.addLayout(roots_row)
+
+        filter_row = QHBoxLayout()
+        self.show_hidden_chk = QCheckBox("Mostra nascosti e sistema")
+        self.show_hidden_chk.setChecked(True)
+        self.show_hidden_chk.toggled.connect(self._apply_filters)
+        filter_row.addWidget(self.show_hidden_chk)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        self.model = QFileSystemModel(self)
+        self.model.setReadOnly(True)
+        self._apply_filters()
+        self.model.setRootPath("")
+
+        self.tree = QTreeView()
+        self.tree.setModel(self.model)
+        self.tree.setSortingEnabled(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree.doubleClicked.connect(self._open_index)
+        self.tree.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 4):
+            self.tree.header().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        layout.addWidget(self.tree, stretch=1)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("statusLabel")
+        bottom.addWidget(self.status_label, stretch=1)
+
+        self.open_btn = QPushButton("Apri")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(self._open_selected)
+        bottom.addWidget(self.open_btn)
+
+        self.organize_btn = QPushButton("Usa in Organizza")
+        self.organize_btn.setObjectName("accentBtn")
+        self.organize_btn.setEnabled(False)
+        self.organize_btn.clicked.connect(self._send_to_organize)
+        bottom.addWidget(self.organize_btn)
+        layout.addLayout(bottom)
+
+    def _drive_paths(self) -> list[str]:
+        drives: list[str] = []
+        for info in QDir.drives():
+            path = info.absoluteFilePath()
+            if path:
+                drives.append(path.replace("/", "\\"))
+        return drives
+
+    def _quick_folders(self) -> list[tuple[str, Path]]:
+        folders: list[tuple[str, Path]] = [("Home", Path.home())]
+        desktop = Path.home() / "Desktop"
+        downloads = Path.home() / "Downloads"
+        if desktop.exists():
+            folders.append(("Desktop", desktop))
+        if downloads.exists():
+            folders.append(("Downloads", downloads))
+        return folders
+
+    def _default_root(self) -> Path:
+        c_drive = Path("C:/")
+        if c_drive.exists():
+            return c_drive
+        drives = self._drive_paths()
+        if drives:
+            return Path(drives[0])
+        return Path.home()
+
+    def _admin_status_text(self) -> str:
+        return "Permessi: amministratore" if _is_running_as_admin() else "Permessi: standard"
+
+    def _apply_filters(self):
+        flags = QDir.AllEntries | QDir.NoDotAndDotDot
+        if getattr(self, "show_hidden_chk", None) is not None and self.show_hidden_chk.isChecked():
+            flags |= QDir.Hidden | QDir.System
+        self.model.setFilter(flags)
+
+    def _path_access_note(self, path: Path) -> str:
+        if path.is_dir() and not os.access(str(path), os.R_OK):
+            return "Accesso negato o limitato. Riavvia come amministratore per vedere piu' contenuti."
+        return ""
+
+    def _restart_as_admin(self):
+        if _is_running_as_admin():
+            self.status_label.setText("L'app e' gia' in esecuzione come amministratore.")
+            return
+        if _relaunch_as_admin():
+            self.status_label.setText("Riavvio come amministratore richiesto. Conferma la finestra UAC.")
+            QApplication.instance().quit()
+        else:
+            self.status_label.setText("Riavvio come amministratore annullato o non riuscito.")
+
+    def _set_root(self, path: Path):
+        if not path.exists():
+            return
+        root = path if path.is_dir() else path.parent
+        root_str = str(root)
+        self._apply_filters()
+        root_index = self.model.setRootPath(root_str)
+        self.tree.setRootIndex(root_index)
+        self.path_edit.setText(root_str)
+        note = self._path_access_note(root)
+        self.status_label.setText(f"Root: {root_str}" + (f" - {note}" if note else ""))
+        self.open_btn.setEnabled(False)
+        self.organize_btn.setEnabled(root.is_dir())
+
+    def _browse_root(self):
+        folder = QFileDialog.getExistingDirectory(self, "Scegli root File Explorer")
+        if folder:
+            self._set_root(Path(folder))
+
+    def _refresh(self):
+        root = Path(self.path_edit.text()) if self.path_edit.text() else Path.home()
+        self._set_root(root)
+
+    def _selected_path(self) -> Path | None:
+        index = self.tree.currentIndex()
+        if not index.isValid():
+            return None
+        index = index.sibling(index.row(), 0)
+        file_path = self.model.filePath(index)
+        return Path(file_path) if file_path else None
+
+    def _selected_folder(self) -> Path | None:
+        path = self._selected_path()
+        if path is None:
+            return None
+        return path if path.is_dir() else path.parent
+
+    def _on_selection_changed(self, *_args):
+        path = self._selected_path()
+        if path is None:
+            self.status_label.setText("")
+            self.open_btn.setEnabled(False)
+            self.organize_btn.setEnabled(False)
+            return
+        note = self._path_access_note(path)
+        self.status_label.setText(str(path) + (f" - {note}" if note else ""))
+        self.open_btn.setEnabled(True)
+        self.organize_btn.setEnabled(self._selected_folder() is not None)
+
+    def _open_index(self, index):
+        if not index.isValid():
+            return
+        path = Path(self.model.filePath(index.sibling(index.row(), 0)))
+        if path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_selected(self):
+        path = self._selected_path()
+        if path is not None and path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _send_to_organize(self):
+        folder = self._selected_folder()
+        if folder is not None and folder.is_dir():
+            self.folder_selected_for_organize.emit(str(folder))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3510,6 +3941,7 @@ class MainWindow(QMainWindow):
         self.swap_tab = SwapTab()
         self.multi_swap_tab = MultiSwapTab()
         self.folder_rename_tab = FolderRenameTab()
+        self.file_explorer_tab = FileExplorerTab()
         self.history_tab = HistoryTab()
         self.settings_tab = SettingsTab()
 
@@ -3517,7 +3949,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.swap_tab, "Swap")
         self.tabs.addTab(self.multi_swap_tab, "Swap multiplo")
         self.tabs.addTab(self.folder_rename_tab, "Rinomina cartelle")
-        self.tabs.addTab(self.history_tab, "Cronologia")
+        self.tabs.addTab(self.file_explorer_tab, "File Explorer")
+        self.tabs.addTab(self.history_tab, "Logs")
         self.tabs.addTab(self.settings_tab, "Impostazioni")
         main_layout.addWidget(self.tabs)
 
@@ -3526,12 +3959,19 @@ class MainWindow(QMainWindow):
         self.swap_tab.operation_completed.connect(self.history_tab.add_entry)
         self.multi_swap_tab.operation_completed.connect(self.history_tab.add_entry)
         self.folder_rename_tab.operation_completed.connect(self.history_tab.add_entry)
+        self.file_explorer_tab.folder_selected_for_organize.connect(
+            self._send_explorer_folder_to_organize
+        )
 
         self._apply_theme()
 
         # Primo avvio: se nessun modello scaricato, apri tab Impostazioni
         if not get_downloaded_models():
             self.tabs.setCurrentWidget(self.settings_tab)
+
+    def _send_explorer_folder_to_organize(self, path: str):
+        self.organize_tab._set_folder(path)
+        self.tabs.setCurrentWidget(self.organize_tab)
 
     def _toggle_theme(self):
         self._dark = not self._dark
