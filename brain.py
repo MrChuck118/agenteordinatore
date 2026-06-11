@@ -729,10 +729,17 @@ class LocalClassifier:
 
 # ── Istanza globale e interfaccia pubblica ──────────────────────────
 
+class DeepSeekAPIError(RuntimeError):
+    def __init__(self, message: str, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
+
+
 class DeepSeekClassifier:
     """Classificatore remoto DeepSeek compatibile con l'interfaccia locale."""
 
     BASE_URL = "https://api.deepseek.com/chat/completions"
+    FALLBACK_MODEL = "deepseek-v4-pro"
 
     def __init__(self, model: str = "deepseek-v4-flash", api_key: str | None = None):
         self.model = model if model in DEEPSEEK_MODELS else "deepseek-v4-flash"
@@ -753,6 +760,47 @@ class DeepSeekClassifier:
         """Nessuna risorsa locale da scaricare."""
         return None
 
+    def _can_fallback(self, model: str) -> bool:
+        return model == "deepseek-v4-flash"
+
+    @staticmethod
+    def _is_recoverable_http_error(code: int, message: str) -> bool:
+        if code in {408, 409, 425, 429} or code >= 500:
+            return True
+        lowered = message.lower()
+        recoverable_markers = (
+            "busy",
+            "model",
+            "overload",
+            "rate",
+            "temporar",
+            "timeout",
+            "unavailable",
+        )
+        return code == 400 and any(marker in lowered for marker in recoverable_markers)
+
+    @staticmethod
+    def _is_response_usable(response: dict) -> bool:
+        return bool(DeepSeekClassifier._message_content(response).strip())
+
+    def _post_chat_fallback(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float | None,
+        stop: list[str] | None,
+    ) -> dict:
+        response = self._post_chat_once(
+            self.FALLBACK_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+        )
+        if not self._is_response_usable(response):
+            raise DeepSeekAPIError("Risposta DeepSeek fallback vuota o non utilizzabile.")
+        return response
+
     def _post_chat(
         self,
         messages: list[dict],
@@ -760,8 +808,45 @@ class DeepSeekClassifier:
         temperature: float | None = 0.1,
         stop: list[str] | None = None,
     ) -> dict:
+        try:
+            response = self._post_chat_once(
+                self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+            )
+            if self._is_response_usable(response):
+                return response
+            if self._can_fallback(self.model):
+                _log.warning(
+                    "DeepSeek response empty, fallback model=%s -> %s",
+                    self.model,
+                    self.FALLBACK_MODEL,
+                )
+                return self._post_chat_fallback(messages, max_tokens, temperature, stop)
+            raise DeepSeekAPIError("Risposta DeepSeek vuota o non utilizzabile.")
+        except DeepSeekAPIError as exc:
+            if not exc.recoverable or not self._can_fallback(self.model):
+                raise
+            _log.warning(
+                "DeepSeek fallback model=%s -> %s: %s",
+                self.model,
+                self.FALLBACK_MODEL,
+                exc,
+            )
+            return self._post_chat_fallback(messages, max_tokens, temperature, stop)
+
+    def _post_chat_once(
+        self,
+        model: str,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float | None = 0.1,
+        stop: list[str] | None = None,
+    ) -> dict:
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "stream": False,
@@ -793,18 +878,34 @@ class DeepSeekClassifier:
             except Exception:
                 detail = ""
             message = self._extract_error_message(detail) or exc.reason
-            raise RuntimeError(f"DeepSeek API HTTP {exc.code}: {message}") from exc
+            recoverable = self._is_recoverable_http_error(exc.code, message)
+            raise DeepSeekAPIError(
+                f"DeepSeek API HTTP {exc.code}: {message}",
+                recoverable=recoverable,
+            ) from exc
         except URLError as exc:
-            raise RuntimeError(f"Connessione DeepSeek fallita: {exc.reason}") from exc
+            raise DeepSeekAPIError(
+                f"Connessione DeepSeek fallita: {exc.reason}",
+                recoverable=True,
+            ) from exc
+        except TimeoutError as exc:
+            raise DeepSeekAPIError("Timeout DeepSeek.", recoverable=True) from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("Risposta DeepSeek non valida.") from exc
+            raise DeepSeekAPIError("Risposta DeepSeek non valida.", recoverable=True) from exc
 
         if "error" in data:
             message = self._extract_error_message(json.dumps(data["error"], ensure_ascii=False))
-            raise RuntimeError(f"DeepSeek API: {message or 'errore sconosciuto'}")
+            recoverable = any(
+                marker in message.lower()
+                for marker in ("busy", "overload", "rate", "temporar", "timeout", "unavailable")
+            )
+            raise DeepSeekAPIError(
+                f"DeepSeek API: {message or 'errore sconosciuto'}",
+                recoverable=recoverable,
+            )
         return data
 
     @staticmethod

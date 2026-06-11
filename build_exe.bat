@@ -13,6 +13,7 @@ set EXE_PATH=%DIST_DIR%\%APP_NAME%.exe
 set BUILD_VENV=.venv-build
 set BUILD_PY=%BUILD_VENV%\Scripts\python.exe
 set PYTHON_EXE=
+set ENV_BACKUP=%TEMP%\AgentOrdinatore_build_env_%RANDOM%.tmp
 
 if not exist "%BUILD_PY%" (
     rem Cerca prima installazioni Python utente comuni, poi PATH/launcher.
@@ -105,6 +106,10 @@ if errorlevel 1 (
 )
 
 echo [3/5] Pulizia build precedenti...
+if exist "%DIST_DIR%\.env" (
+    echo   Preservo configurazione locale .env...
+    copy /y "%DIST_DIR%\.env" "%ENV_BACKUP%" >nul
+)
 if exist "build" rmdir /s /q "build"
 if exist "dist\%APP_NAME%" rmdir /s /q "dist\%APP_NAME%"
 
@@ -127,6 +132,14 @@ if not exist "%EXE_PATH%" (
     if not defined NO_PAUSE pause
     exit /b 1
 )
+
+if exist "%ENV_BACKUP%" (
+    copy /y "%ENV_BACKUP%" "%DIST_DIR%\.env" >nul
+    del /q "%ENV_BACKUP%" >nul 2>&1
+)
+
+if exist ".env.example" copy /y ".env.example" "%DIST_DIR%\.env.example" >nul
+if exist "GUIDA_TESTER.md" copy /y "GUIDA_TESTER.md" "%DIST_DIR%\GUIDA_TESTER.md" >nul
 
 echo.
 echo ============================================================

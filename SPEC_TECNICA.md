@@ -81,8 +81,12 @@ Il backend AI e' configurabile nelle Impostazioni:
 
 Modelli DeepSeek supportati:
 
-- `deepseek-v4-flash`
+- `deepseek-v4-flash`: default, con fallback automatico a `deepseek-v4-pro`
+  solo per errori tecnici recuperabili o risposta API vuota/non utilizzabile.
 - `deepseek-v4-pro`
+
+Se l'utente seleziona esplicitamente `deepseek-v4-pro`, l'app usa direttamente
+Pro e non applica un ulteriore fallback.
 
 La chiamata DeepSeek e' implementata con la libreria standard Python (`urllib`)
 per evitare nuove dipendenze runtime pesanti. Le richieste usano `stream=false`
@@ -223,6 +227,10 @@ Per distribuzione tester viene creato uno ZIP della cartella
 
 Lo ZIP resta fuori da Git e puo' essere pubblicato come asset di GitHub Release.
 
+`build_exe.bat` preserva `dist\Agent Ordinatore\.env` se presente: lo copia
+temporaneamente prima della pulizia della cartella `dist` e lo ripristina dopo
+la build. Copia inoltre `.env.example` e `GUIDA_TESTER.md` nella portable.
+
 La build usa PyInstaller `onedir`, non `onefile`, per ridurre falsi positivi
 antivirus, migliorare tempi di avvio e gestire meglio librerie native Qt e
 llama.cpp.
@@ -285,7 +293,8 @@ Risultato ultimo controllo:
 
 - Import runtime e GUI: OK.
 - CLI help: OK.
-- Test automatici: 23 test `unittest`, inclusi parser locali e mock DeepSeek.
+- Test automatici: 26 test `unittest`, inclusi parser locali, mock DeepSeek e
+  fallback Flash -> Pro.
 
 ## File da non distribuire
 

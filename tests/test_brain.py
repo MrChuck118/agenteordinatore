@@ -1,6 +1,6 @@
 import unittest
 
-from brain import DeepSeekClassifier, LocalClassifier
+from brain import DeepSeekAPIError, DeepSeekClassifier, LocalClassifier
 
 
 class StubDeepSeekClassifier(DeepSeekClassifier):
@@ -17,6 +17,21 @@ class StubDeepSeekClassifier(DeepSeekClassifier):
             "stop": stop,
         })
         return {"choices": [{"message": {"content": self.reply}}]}
+
+
+class FallbackDeepSeekClassifier(DeepSeekClassifier):
+    def __init__(self, model: str, flash_response, pro_response):
+        super().__init__(model=model, api_key="test-key")
+        self.flash_response = flash_response
+        self.pro_response = pro_response
+        self.models_called = []
+
+    def _post_chat_once(self, model, messages, max_tokens, temperature=0.1, stop=None):
+        self.models_called.append(model)
+        response = self.flash_response if model == "deepseek-v4-flash" else self.pro_response
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FolderRenameParserTests(unittest.TestCase):
@@ -85,6 +100,42 @@ class DeepSeekClassifierTests(unittest.TestCase):
             DeepSeekClassifier._extract_error_message(raw),
             "invalid api key",
         )
+
+    def test_flash_falls_back_to_pro_on_recoverable_error(self):
+        classifier = FallbackDeepSeekClassifier(
+            model="deepseek-v4-flash",
+            flash_response=DeepSeekAPIError("timeout", recoverable=True),
+            pro_response={"choices": [{"message": {"content": '{"category":"Documenti/PDF"}'}}]},
+        )
+
+        category = classifier.classify_file("fattura.pdf", "10 KB")
+
+        self.assertEqual(category, "Documenti/PDF")
+        self.assertEqual(classifier.models_called, ["deepseek-v4-flash", "deepseek-v4-pro"])
+
+    def test_flash_falls_back_to_pro_on_empty_response(self):
+        classifier = FallbackDeepSeekClassifier(
+            model="deepseek-v4-flash",
+            flash_response={"choices": [{"message": {"content": ""}}]},
+            pro_response={"choices": [{"message": {"content": "B"}}]},
+        )
+
+        result = classifier.classify_for_swap("foto.jpg", "1 MB", "A", "B", [], [])
+
+        self.assertEqual(result, "B")
+        self.assertEqual(classifier.models_called, ["deepseek-v4-flash", "deepseek-v4-pro"])
+
+    def test_pro_does_not_fallback(self):
+        classifier = FallbackDeepSeekClassifier(
+            model="deepseek-v4-pro",
+            flash_response={"choices": [{"message": {"content": "A"}}]},
+            pro_response=DeepSeekAPIError("timeout", recoverable=True),
+        )
+
+        with self.assertRaises(DeepSeekAPIError):
+            classifier.classify_for_swap("foto.jpg", "1 MB", "A", "B", [], [])
+
+        self.assertEqual(classifier.models_called, ["deepseek-v4-pro"])
 
 
 if __name__ == "__main__":

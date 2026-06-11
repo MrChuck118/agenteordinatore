@@ -82,7 +82,8 @@ I file `.gguf` non vengono inclusi in `dist/` ne' nell'installer. Restano gestit
 Questo evita pacchetti enormi e permette di scaricare solo il tier scelto dall'utente.
 
 DeepSeek API non richiede modelli locali ma richiede una API key configurata in
-locale. Non distribuire `.env` con chiavi personali.
+locale. Il modello default e' Flash con fallback automatico a Pro per problemi
+recuperabili. Non distribuire `.env` con chiavi personali.
 
 ## Note
 

@@ -436,3 +436,65 @@ Tentativo Release:
   file, ma non per creare release o caricare asset binari.
 - La Release GitHub con asset ZIP non e' stata creata in questa sessione.
 - Lo ZIP tester e il file `.sha256` restano pronti localmente in `dist\`.
+
+### Richiesta fallback DeepSeek Flash -> Pro
+
+L'utente ha creato il file `.env` partendo da `.env.example` e ha inserito
+manualmente la API key DeepSeek. Non va letto o loggato il contenuto del file
+`.env`.
+
+Nuova richiesta di comportamento:
+
+- con DeepSeek API, il default deve chiamare `deepseek-v4-flash`;
+- se Flash fallisce, deve fare fallback automatico a `deepseek-v4-pro`;
+- se dal menu viene selezionato esplicitamente `deepseek-v4-pro`, l'app deve
+  chiamare direttamente Pro senza fallback ulteriore.
+
+Proposta da approvare:
+
+- trattare l'opzione Flash come `Flash + fallback Pro`;
+- usare il fallback solo per errori tecnici recuperabili o risposta API non
+  utilizzabile, evitando doppie chiamate quando il modello restituisce una
+  classificazione valida ma incerta;
+- mostrare nel menu una label chiara tipo `DeepSeek V4 Flash (fallback Pro)`;
+- loggare solo il nome modello e il fatto che e' avvenuto fallback, mai API key
+  o contenuto sensibile.
+
+Implementazione:
+
+- aggiunta eccezione `DeepSeekAPIError` con flag `recoverable`;
+- `DeepSeekClassifier` ora tenta prima `deepseek-v4-flash` quando selezionato;
+- se Flash fallisce per errore recuperabile o risposta vuota, effettua una
+  seconda chiamata con `deepseek-v4-pro`;
+- se l'utente seleziona direttamente `deepseek-v4-pro`, non viene applicato
+  ulteriore fallback;
+- aggiornata la label UI a `DeepSeek V4 Flash (fallback Pro)`;
+- aggiunti test unitari per fallback su errore recuperabile, fallback su risposta
+  vuota e assenza di fallback quando Pro e' selezionato direttamente;
+- aggiornate spec, README e packaging.
+
+Verifiche e build:
+
+- `py_compile` su `gui.py`, `main.py`, `brain.py`, `config.py`: OK.
+- Test automatici: 26 test `unittest`, tutti OK.
+- Smoke test GUI offscreen:
+  - label modelli DeepSeek:
+    `DeepSeek V4 Flash (fallback Pro)` e `DeepSeek V4 Pro`;
+  - modello selezionato di default: `deepseek-v4-flash`.
+- `main.py --help`: OK.
+- Build portable `build_exe.bat`: completata correttamente.
+
+Nota operativa:
+
+- La rebuild PyInstaller pulisce `dist\Agent Ordinatore`.
+- Dopo la build non risultava piu' presente `.env` nella portable o nella root
+  del progetto. Il contenuto del file `.env` non e' stato letto.
+- Per evitare che ricapiti, `build_exe.bat` e' stato aggiornato per preservare
+  automaticamente `dist\Agent Ordinatore\.env` se presente prima della pulizia.
+- Lo script ora copia anche `.env.example` e `GUIDA_TESTER.md` dentro la
+  portable dopo la build.
+- Nuovo EXE:
+  `dist\Agent Ordinatore\Agent Ordinatore.exe`.
+- Ultima modifica EXE: 2026-06-11 18:55:58.
+- Dimensione EXE: circa 10,6 MB.
+- Dimensione cartella portable: circa 142,85 MB.

@@ -27,6 +27,8 @@ Organizzatore di file basato su Intelligenza Artificiale con backend selezionabi
    Per Qwen locale scarica un modello AI (consigliato: *Standard* se hai
    almeno 6 GB di RAM). Per DeepSeek API inserisci la chiave nel campo
    mascherato oppure crea un file `.env` partendo da `.env.example`.
+   Il default DeepSeek e' `V4 Flash` con fallback automatico a `V4 Pro` se
+   Flash non e' temporaneamente utilizzabile.
 
    Se la build portable esiste, il launcher apre direttamente l'EXE.
 

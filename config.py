@@ -31,7 +31,7 @@ AI_BACKEND_LOCAL = "local"
 AI_BACKEND_DEEPSEEK = "deepseek"
 
 DEEPSEEK_MODELS = {
-    "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "deepseek-v4-flash": "DeepSeek V4 Flash (fallback Pro)",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
 }
 
