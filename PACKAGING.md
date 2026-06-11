@@ -37,6 +37,10 @@ dist/
 
 Questa cartella e' portable: puoi copiarla su un altro PC Windows compatibile e avviare `Agent Ordinatore.exe`.
 
+Per usare DeepSeek API nella portable, copia `.env.example` accanto a
+`Agent Ordinatore.exe`, rinominalo in `.env` e inserisci `DEEPSEEK_API_KEY`.
+In alternativa inserisci la chiave dal tab Impostazioni.
+
 La build portable usa `PySide6-Essentials` e una lista di exclude PyInstaller per
 tenere fuori librerie non usate come `django`, `pandas`, `scipy`, `pyarrow`,
 `boto3`, `botocore`, `fastapi`, `starlette`, `torch`, `tensorflow` e Qt WebEngine.
@@ -76,6 +80,9 @@ I file `.gguf` non vengono inclusi in `dist/` ne' nell'installer. Restano gestit
 ```
 
 Questo evita pacchetti enormi e permette di scaricare solo il tier scelto dall'utente.
+
+DeepSeek API non richiede modelli locali ma richiede una API key configurata in
+locale. Non distribuire `.env` con chiavi personali.
 
 ## Note
 

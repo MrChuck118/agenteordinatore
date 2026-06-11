@@ -1,7 +1,7 @@
 # Agent Ordinatore
 
-Organizzatore di file basato su Intelligenza Artificiale **locale** (nessun dato esce dal tuo PC).
-Funziona offline, rispetta la privacy, gira su Windows.
+Organizzatore di file basato su Intelligenza Artificiale con backend selezionabile:
+**Qwen locale** oppure **DeepSeek API**. Gira su Windows.
 
 ## Requisiti
 
@@ -9,7 +9,7 @@ Funziona offline, rispetta la privacy, gira su Windows.
 - **Python 3.10, 3.11, 3.12 o 3.13** scaricabile da https://www.python.org/downloads/
   (durante l'installazione spunta la casella **"Add Python to PATH"**)
 - **Almeno 4 GB di RAM** (per il modello più leggero)
-- **Connessione Internet** solo al primo avvio, per scaricare il modello AI
+- **Connessione Internet** solo per scaricare il modello locale o usare DeepSeek API
 - *(Opzionale)* **GPU NVIDIA con CUDA 12** per inferenza accelerata
 
 ## Installazione in 2 passi
@@ -23,8 +23,10 @@ Funziona offline, rispetta la privacy, gira su Windows.
 2. **Doppio click su `Agent Ordinatore.bat`**
 
    Avvia l'interfaccia grafica.
-   Al primo avvio vai nel tab **Impostazioni** e scarica un modello AI
-   (consigliato: *Standard* se hai almeno 6 GB di RAM).
+   Al primo avvio vai nel tab **Impostazioni** e scegli il provider AI.
+   Per Qwen locale scarica un modello AI (consigliato: *Standard* se hai
+   almeno 6 GB di RAM). Per DeepSeek API inserisci la chiave nel campo
+   mascherato oppure crea un file `.env` partendo da `.env.example`.
 
    Se la build portable esiste, il launcher apre direttamente l'EXE.
 
@@ -55,7 +57,7 @@ una scelta per singola operazione tramite **Proponi rinomina cartelle**.
 
 ## Cronologia e Log
 
-- Il tab **Cronologia** mostra le ultime operazioni eseguite.
+- Il tab **Logs** mostra le ultime operazioni eseguite.
 - Tutti gli spostamenti, le copie e le rinomine cartelle (`RENAME_FOLDER`) vengono
   tracciati in `moves.log` (cronologia completa, grep-friendly).
 - Per aprire la cartella log: **Impostazioni → Apri cartella log**
@@ -86,6 +88,9 @@ python main.py rename-folders "C:\Archivio" --execute
 python main.py setup --list
 ```
 
+Se nelle Impostazioni hai selezionato DeepSeek API, la CLI usa DeepSeek quando
+non passi `--tier`. Se passi `--tier`, il comando forza il modello Qwen locale.
+
 L'output CLI usa marker testuali ASCII come `[INFO]`, `[MOVE]`, `[COPY]` e `[OK]`
 per restare compatibile anche con console Windows legacy.
 
@@ -102,6 +107,7 @@ dry-run non distruttivo e parser base della rinomina cartelle.
 
 ## Privacy
 
-- Nessun dato viene inviato a server esterni.
-- Il modello AI gira interamente sul tuo PC.
-- L'unica richiesta di rete è il download iniziale del modello da HuggingFace.
+- Con **Qwen locale**, il modello AI gira interamente sul tuo PC.
+- Con **DeepSeek API**, l'app invia a DeepSeek i nomi file/cartelle e i campioni
+  necessari alla classificazione.
+- Non committare `.env`: usa `.env.example` come modello e inserisci la chiave a mano.

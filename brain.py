@@ -1,16 +1,28 @@
 """
 brain.py — Classificazione intelligente dei file.
 
-Usa un modello locale Qwen3.5 (GGUF) tramite llama-cpp-python.
+Usa un modello locale Qwen3.5 (GGUF) tramite llama-cpp-python
+oppure DeepSeek via API.
 """
 
 import json
 import re
 import subprocess
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from model_manager import MODELS, get_model_path
 from utils import format_size, sanitize_category, sanitize_folder_name
 from logger import get_app_logger
+from config import (
+    AI_BACKEND_DEEPSEEK,
+    AI_BACKEND_LOCAL,
+    DEEPSEEK_MODELS,
+    get_ai_backend,
+    get_deepseek_api_key,
+    get_deepseek_model,
+    get_selected_tier,
+)
 
 _log = get_app_logger()
 
@@ -28,10 +40,20 @@ TIER_STRATEGY = {
     "ultra":    {"chunk_size": 8, "n_ctx": 16384, "sample_files": 30},
 }
 
+DEEPSEEK_STRATEGY = {
+    "deepseek-v4-flash": {"chunk_size": 8, "sample_files": 30},
+    "deepseek-v4-pro": {"chunk_size": 10, "sample_files": 40},
+}
+
 
 def get_tier_strategy(tier: str) -> dict:
     """Ritorna la strategia per il tier indicato, fallback su 'standard'."""
     return TIER_STRATEGY.get(tier, TIER_STRATEGY["standard"])
+
+
+def get_deepseek_strategy(model: str) -> dict:
+    """Ritorna la strategia per il modello DeepSeek indicato."""
+    return DEEPSEEK_STRATEGY.get(model, DEEPSEEK_STRATEGY["deepseek-v4-flash"])
 
 
 # ── Prompt di sistema per il modello locale ─────────────────────────
@@ -707,25 +729,360 @@ class LocalClassifier:
 
 # ── Istanza globale e interfaccia pubblica ──────────────────────────
 
+class DeepSeekClassifier:
+    """Classificatore remoto DeepSeek compatibile con l'interfaccia locale."""
+
+    BASE_URL = "https://api.deepseek.com/chat/completions"
+
+    def __init__(self, model: str = "deepseek-v4-flash", api_key: str | None = None):
+        self.model = model if model in DEEPSEEK_MODELS else "deepseek-v4-flash"
+        self.tier = self.model
+        self.api_key = (api_key or "").strip()
+        self.timeout = 60
+
+    def _get_api_key(self) -> str:
+        api_key = self.api_key or get_deepseek_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "API key DeepSeek non configurata. Inseriscila nelle Impostazioni "
+                "o in un file .env con DEEPSEEK_API_KEY."
+            )
+        return api_key
+
+    def unload(self):
+        """Nessuna risorsa locale da scaricare."""
+        return None
+
+    def _post_chat(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float | None = 0.1,
+        stop: list[str] | None = None,
+    ) -> dict:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "thinking": {"type": "disabled"},
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if stop:
+            payload["stop"] = stop
+
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            self.BASE_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self._get_api_key()}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            message = self._extract_error_message(detail) or exc.reason
+            raise RuntimeError(f"DeepSeek API HTTP {exc.code}: {message}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Connessione DeepSeek fallita: {exc.reason}") from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Risposta DeepSeek non valida.") from exc
+
+        if "error" in data:
+            message = self._extract_error_message(json.dumps(data["error"], ensure_ascii=False))
+            raise RuntimeError(f"DeepSeek API: {message or 'errore sconosciuto'}")
+        return data
+
+    @staticmethod
+    def _extract_error_message(raw: str) -> str:
+        if not raw:
+            return ""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw[:240]
+        if isinstance(data, dict):
+            error = data.get("error", data)
+            if isinstance(error, dict):
+                return str(error.get("message") or error.get("type") or "")[:240]
+            return str(error)[:240]
+        return str(data)[:240]
+
+    @staticmethod
+    def _message_content(response: dict) -> str:
+        try:
+            content = response["choices"][0]["message"].get("content", "")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            content = ""
+        if content is None:
+            return ""
+        return str(content)
+
+    def classify_file(self, filename: str, file_size) -> str:
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        user_message = f'filename: "{filename}", size: "{size_str}"'
+        response = self._post_chat(
+            messages=[
+                {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=100,
+            temperature=0.1,
+            stop=["\n\n"],
+        )
+        result_text = self._message_content(response)
+        category = sanitize_category(LocalClassifier._parse_category(result_text))
+        _log.debug("deepseek classify_file: %s (%s) -> %s", filename, size_str, category)
+        return category
+
+    def classify_for_swap(
+        self, filename, file_size, folder_a_name, folder_b_name,
+        folder_a_files, folder_b_files
+    ) -> str | None:
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        sample_files = get_deepseek_strategy(self.model)["sample_files"]
+        files_a = ", ".join(folder_a_files[:sample_files])
+        files_b = ", ".join(folder_b_files[:sample_files])
+        user_message = (
+            f'File: "{filename}" ({size_str})\n'
+            f'Folder A "{folder_a_name}": [{files_a}]\n'
+            f'Folder B "{folder_b_name}": [{files_b}]'
+        )
+
+        response = self._post_chat(
+            messages=[
+                {"role": "system", "content": SWAP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=10,
+            temperature=0.1,
+            stop=["\n"],
+        )
+        choice = LocalClassifier._parse_swap(self._message_content(response))
+        _log.debug("deepseek classify_for_swap: %s -> %s", filename, choice)
+        return choice
+
+    @staticmethod
+    def _short_path(path_str: str, segments: int = 3) -> str:
+        return LocalClassifier._short_path(path_str, segments=segments)
+
+    def classify_best_of_n(
+        self, filename: str, file_size,
+        folder_specs: list[dict],
+    ) -> int | None:
+        if not folder_specs:
+            raise ValueError("folder_specs vuoto")
+        if len(folder_specs) == 1:
+            return 0
+
+        if isinstance(file_size, int):
+            size_str = format_size(file_size)
+        else:
+            size_str = str(file_size) if file_size else "0 B"
+
+        sample_files = get_deepseek_strategy(self.model)["sample_files"]
+        lines = [f'File: "{filename}" ({size_str})']
+        for idx, spec in enumerate(folder_specs):
+            name = spec.get("name", "")
+            short = self._short_path(spec.get("path", ""))
+            files_sample = ", ".join((spec.get("files") or [])[:sample_files])
+            label = f"{name} ({short})" if short else name
+            lines.append(f"{idx}: {label} -> [{files_sample}]")
+        user_message = "\n".join(lines)
+
+        response = self._post_chat(
+            messages=[
+                {"role": "system", "content": MULTI_SWAP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=10,
+            temperature=0.1,
+            stop=["\n"],
+        )
+        idx = LocalClassifier._parse_index(self._message_content(response), len(folder_specs))
+        if idx is None:
+            _log.debug("deepseek classify_best_of_n: '%s' -> incerto", filename)
+            return None
+        _log.debug("deepseek classify_best_of_n: '%s' -> idx=%d", filename, idx)
+        return idx
+
+    def classify_for_multi_swap(
+        self, filename: str, file_size,
+        folder_specs: list[dict],
+        target_path: str | None = None,
+    ) -> int | None:
+        n = len(folder_specs)
+        if n == 0:
+            raise ValueError("folder_specs vuoto")
+        if n == 1:
+            return 0
+
+        chunk_size = max(2, get_deepseek_strategy(self.model)["chunk_size"])
+        if n <= chunk_size:
+            return self.classify_best_of_n(filename, file_size, folder_specs)
+
+        active_indices = list(range(n))
+        while len(active_indices) > 1:
+            next_active: list[int] = []
+            for start in range(0, len(active_indices), chunk_size):
+                chunk_orig = active_indices[start:start + chunk_size]
+                if len(chunk_orig) == 1:
+                    next_active.append(chunk_orig[0])
+                    continue
+                chunk_specs = [folder_specs[i] for i in chunk_orig]
+                local_winner = self.classify_best_of_n(filename, file_size, chunk_specs)
+                if local_winner is None:
+                    return None
+                next_active.append(chunk_orig[local_winner])
+            active_indices = next_active
+        return active_indices[0]
+
+    def suggest_folder_rename(self, profile: dict) -> dict:
+        current_name = str(profile.get("current_name") or "Cartella")
+        if profile.get("protected"):
+            markers = ", ".join(profile.get("project_markers") or [])
+            return {
+                "action": "keep",
+                "suggested_name": current_name,
+                "confidence": 1.0,
+                "reason": f"Cartella protetta: marker progetto rilevati ({markers}).",
+            }
+
+        if int(profile.get("file_count") or 0) == 0:
+            return {
+                "action": "keep",
+                "suggested_name": current_name,
+                "confidence": 1.0,
+                "reason": "Cartella vuota: rinomina non proposta.",
+            }
+
+        extensions = profile.get("extensions") or {}
+        files = profile.get("sample_files") or []
+        marker_text = ", ".join(profile.get("project_markers") or [])
+        extensions_text = json.dumps(extensions, ensure_ascii=False)
+        files_text = ", ".join(files[:get_deepseek_strategy(self.model)["sample_files"]])
+        user_message = (
+            f'Current folder: "{current_name}"\n'
+            f"Weak name: {bool(profile.get('weak_name'))}\n"
+            f"Project markers: [{marker_text}]\n"
+            f"File count: {profile.get('file_count', 0)}\n"
+            f"Total size: {profile.get('total_size_str', '')}\n"
+            f"Extensions: {extensions_text}\n"
+            f"Files: [{files_text}]"
+        )
+
+        response = self._post_chat(
+            messages=[
+                {"role": "system", "content": FOLDER_RENAME_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=160,
+            temperature=0.1,
+            stop=["\n\n"],
+        )
+
+        result = LocalClassifier._parse_folder_rename(
+            self._message_content(response),
+            current_name,
+        )
+        suggested = sanitize_folder_name(result["suggested_name"], fallback=current_name)
+        result["suggested_name"] = suggested
+
+        same_name = suggested.lower() == current_name.lower()
+        threshold = 0.65 if profile.get("weak_name") else 0.88
+        if result["action"] == "rename" and (same_name or result["confidence"] < threshold):
+            result["action"] = "keep"
+            if same_name:
+                result["reason"] = "Il nome suggerito coincide con quello attuale."
+            else:
+                result["reason"] = (
+                    f"Confidenza {result['confidence']:.2f} sotto soglia {threshold:.2f}."
+                )
+        return result
+
+
+def test_deepseek_connection(model: str | None = None, api_key: str | None = None) -> str:
+    """Esegue una chiamata minima a DeepSeek e ritorna il testo di risposta."""
+    classifier = DeepSeekClassifier(model=model or get_deepseek_model(), api_key=api_key)
+    response = classifier._post_chat(
+        messages=[
+            {"role": "system", "content": "Rispondi solo con OK."},
+            {"role": "user", "content": "Test connessione"},
+        ],
+        max_tokens=10,
+        temperature=0.0,
+        stop=["\n"],
+    )
+    content = classifier._message_content(response).strip()
+    return content or "OK"
+
+
 _classifier = None
 
 
-def init_classifier(tier: str = "standard"):
-    """Inizializza il classificatore locale con il tier specificato."""
+def init_classifier(
+    tier: str | None = None,
+    backend: str | None = None,
+    deepseek_model: str | None = None,
+):
+    """Inizializza il classificatore con il backend configurato."""
     global _classifier
-    if _classifier is not None and _classifier.tier == tier:
+    selected_backend = backend or get_ai_backend()
+
+    if selected_backend == AI_BACKEND_DEEPSEEK:
+        model = deepseek_model or get_deepseek_model()
+        if (
+            _classifier is not None
+            and isinstance(_classifier, DeepSeekClassifier)
+            and _classifier.model == model
+        ):
+            return
+        if _classifier is not None:
+            _classifier.unload()
+        _classifier = DeepSeekClassifier(model=model)
+        _log.info("Classificatore DeepSeek inizializzato: model=%s", model)
+        return
+
+    selected_tier = tier or get_selected_tier()
+    if (
+        _classifier is not None
+        and isinstance(_classifier, LocalClassifier)
+        and _classifier.tier == selected_tier
+    ):
         return
     if _classifier is not None:
         _classifier.unload()
-    _classifier = LocalClassifier(tier=tier)
+    _classifier = LocalClassifier(tier=selected_tier)
+    _log.info("Classificatore locale inizializzato: tier=%s", selected_tier)
 
 
 def classify_file(filename: str, file_size="") -> str:
     """Classifica un file e ritorna la categoria."""
     global _classifier
     if _classifier is None:
-        from config import get_selected_tier
-        init_classifier(get_selected_tier())
+        init_classifier()
     return _classifier.classify_file(filename, file_size)
 
 
@@ -736,8 +1093,7 @@ def classify_for_swap(
     """Classifica per swap. Ritorna 'A', 'B' o None se incerto."""
     global _classifier
     if _classifier is None:
-        from config import get_selected_tier
-        init_classifier(get_selected_tier())
+        init_classifier()
     return _classifier.classify_for_swap(
         filename, file_size, folder_a_name, folder_b_name,
         folder_a_files, folder_b_files,
@@ -757,8 +1113,7 @@ def classify_for_multi_swap(
     """
     global _classifier
     if _classifier is None:
-        from config import get_selected_tier
-        init_classifier(get_selected_tier())
+        init_classifier()
     return _classifier.classify_for_multi_swap(
         filename, file_size, folder_specs, target_path=target_path,
     )
@@ -768,8 +1123,7 @@ def suggest_folder_rename(profile: dict) -> dict:
     """Wrapper modulo: suggerisce se rinominare una cartella."""
     global _classifier
     if _classifier is None:
-        from config import get_selected_tier
-        init_classifier(get_selected_tier())
+        init_classifier()
     return _classifier.suggest_folder_rename(profile)
 
 

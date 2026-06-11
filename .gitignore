@@ -1,6 +1,7 @@
 # ── Segreti e configurazioni private ──────────────────────────────
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 

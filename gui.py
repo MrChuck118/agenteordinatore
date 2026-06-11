@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (  # type: ignore
     QLabel, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
     QProgressBar, QRadioButton, QButtonGroup, QHeaderView, QAbstractItemView,
     QMessageBox, QTreeWidget, QTreeWidgetItem, QSizePolicy, QLineEdit,
-    QCheckBox, QGroupBox, QFileSystemModel, QTreeView,
+    QCheckBox, QGroupBox, QFileSystemModel, QTreeView, QComboBox,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QTimer, QUrl, QDir  # type: ignore
 from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QDesktopServices  # type: ignore
@@ -49,11 +49,15 @@ from utils import (
 )
 from brain import (
     classify_file, classify_for_swap, classify_for_multi_swap,
-    suggest_folder_rename, init_classifier, unload_model,
+    suggest_folder_rename, init_classifier, unload_model, test_deepseek_connection,
 )
 from config import (
     load_config, save_config, get_theme, set_theme, get_selected_tier,
     set_selected_tier, is_folder_rename_allowed, set_folder_rename_allowed,
+    AI_BACKEND_DEEPSEEK, AI_BACKEND_LOCAL, DEEPSEEK_MODELS,
+    get_ai_backend, set_ai_backend, get_deepseek_model, set_deepseek_model,
+    get_deepseek_api_key, get_deepseek_api_key_source,
+    get_saved_deepseek_api_key, set_deepseek_api_key, is_deepseek_configured,
 )
 from model_manager import (
     MODELS, is_model_downloaded, download_model, delete_model,
@@ -1086,6 +1090,25 @@ class ModelDownloadWorker(QThread):
 
 # ── Drop Area widget ─────────────────────────────────────────────────
 
+class DeepSeekTestWorker(QThread):
+    """Esegue un test API DeepSeek senza bloccare la GUI."""
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, model: str, api_key: str):
+        super().__init__()
+        self.model = model
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            result = test_deepseek_connection(self.model, self.api_key)
+            self.finished.emit(result)
+        except Exception as e:
+            log.exception("DeepSeekTestWorker: test connessione fallito")
+            self.error.emit(str(e))
+
+
 class DropArea(QLabel):
     """Etichetta che accetta drag & drop di cartelle."""
     folder_dropped = Signal(str)
@@ -1128,7 +1151,17 @@ class DropArea(QLabel):
 # ── Utilità condivise GUI ────────────────────────────────────────────
 
 def _check_model_ready(parent: QWidget) -> bool:
-    """Controlla che un modello sia scaricato prima di analizzare."""
+    """Controlla che il backend AI configurato sia pronto prima di analizzare."""
+    if get_ai_backend() == AI_BACKEND_DEEPSEEK:
+        if is_deepseek_configured():
+            return True
+        QMessageBox.warning(
+            parent, "API key mancante",
+            "DeepSeek API non e' configurato.\n\n"
+            "Inserisci la chiave nelle Impostazioni o in un file .env.",
+        )
+        return False
+
     tier = get_selected_tier()
     if not is_model_downloaded(tier):
         QMessageBox.warning(
@@ -1484,9 +1517,8 @@ class OrganizeTab(QWidget):
         if not _check_model_ready(self):
             return
 
-        # Inizializza il classificatore con il tier corrente
-        tier = get_selected_tier()
-        init_classifier(tier)
+        # Inizializza il classificatore con il backend corrente
+        init_classifier()
 
         self.table.setRowCount(0)
         self._analyzed_items.clear()
@@ -1987,8 +2019,7 @@ class SwapTab(QWidget):
         if not _check_model_ready(self):
             return
 
-        tier = get_selected_tier()
-        init_classifier(tier)
+        init_classifier()
 
         self.table.setRowCount(0)
         self._analyzed_items.clear()
@@ -2664,8 +2695,7 @@ class MultiSwapTab(QWidget):
         if not _check_model_ready(self):
             return
 
-        tier = get_selected_tier()
-        init_classifier(tier)
+        init_classifier()
 
         self._folders = valid
         self.table.setRowCount(0)
@@ -3008,7 +3038,7 @@ class FolderRenameTab(QWidget):
         if not _check_model_ready(self):
             return
 
-        init_classifier(get_selected_tier())
+        init_classifier()
         self.table.setRowCount(0)
         self._analyzed_items.clear()
         self.analyze_btn.setEnabled(False)
@@ -3277,6 +3307,7 @@ class SettingsTab(QWidget):
     def __init__(self):
         super().__init__()
         self._download_worker = None
+        self._deepseek_test_worker = None
         self._active_download_tier: str | None = None
         self._download_started_at = 0.0
         self._hw_info = None
@@ -3309,9 +3340,30 @@ class SettingsTab(QWidget):
 
         layout.addWidget(hw_group)
 
+        config = load_config()
+
+        backend_group = QGroupBox("Provider AI")
+        backend_layout = QHBoxLayout(backend_group)
+
+        self._backend_btn_group = QButtonGroup(self)
+        self.local_backend_radio = QRadioButton("Qwen locale")
+        self.deepseek_backend_radio = QRadioButton("DeepSeek API")
+        self._backend_btn_group.addButton(self.local_backend_radio)
+        self._backend_btn_group.addButton(self.deepseek_backend_radio)
+
+        current_backend = get_ai_backend()
+        self.local_backend_radio.setChecked(current_backend == AI_BACKEND_LOCAL)
+        self.deepseek_backend_radio.setChecked(current_backend == AI_BACKEND_DEEPSEEK)
+
+        backend_layout.addWidget(self.local_backend_radio)
+        backend_layout.addWidget(self.deepseek_backend_radio)
+        backend_layout.addStretch()
+        self._backend_btn_group.buttonClicked.connect(self._on_backend_changed)
+        layout.addWidget(backend_group)
+
         # ── Sezione Modello AI ──
-        model_group = QGroupBox("Modello AI")
-        model_layout = QVBoxLayout(model_group)
+        self.local_model_group = QGroupBox("Modello AI locale")
+        model_layout = QVBoxLayout(self.local_model_group)
 
         self._tier_btn_group = QButtonGroup(self)
         current_tier = get_selected_tier()
@@ -3342,11 +3394,56 @@ class SettingsTab(QWidget):
         # Connetti cambio selezione
         self._tier_btn_group.buttonClicked.connect(self._on_tier_changed)
 
-        layout.addWidget(model_group)
+        layout.addWidget(self.local_model_group)
+
+        self.deepseek_group = QGroupBox("DeepSeek API")
+        deepseek_layout = QVBoxLayout(self.deepseek_group)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Modello"))
+        self.deepseek_model_combo = QComboBox()
+        for model_id, label in DEEPSEEK_MODELS.items():
+            self.deepseek_model_combo.addItem(label, model_id)
+        current_deepseek_model = get_deepseek_model()
+        model_index = self.deepseek_model_combo.findData(current_deepseek_model)
+        if model_index >= 0:
+            self.deepseek_model_combo.setCurrentIndex(model_index)
+        self.deepseek_model_combo.currentIndexChanged.connect(self._on_deepseek_model_changed)
+        model_row.addWidget(self.deepseek_model_combo, stretch=1)
+        deepseek_layout.addLayout(model_row)
+
+        key_row = QHBoxLayout()
+        self.deepseek_key_edit = QLineEdit()
+        self.deepseek_key_edit.setEchoMode(QLineEdit.Password)
+        self.deepseek_key_edit.setPlaceholderText("DEEPSEEK_API_KEY")
+        self.deepseek_key_edit.setText(get_saved_deepseek_api_key())
+        key_row.addWidget(self.deepseek_key_edit, stretch=1)
+
+        self.save_deepseek_key_btn = QPushButton("Salva chiave")
+        self.save_deepseek_key_btn.clicked.connect(self._save_deepseek_key)
+        key_row.addWidget(self.save_deepseek_key_btn)
+
+        self.clear_deepseek_key_btn = QPushButton("Rimuovi")
+        self.clear_deepseek_key_btn.clicked.connect(self._clear_deepseek_key)
+        key_row.addWidget(self.clear_deepseek_key_btn)
+        deepseek_layout.addLayout(key_row)
+
+        deepseek_btn_row = QHBoxLayout()
+        self.test_deepseek_btn = QPushButton("Test connessione")
+        self.test_deepseek_btn.clicked.connect(self._test_deepseek_connection)
+        deepseek_btn_row.addWidget(self.test_deepseek_btn)
+        deepseek_btn_row.addStretch()
+        deepseek_layout.addLayout(deepseek_btn_row)
+
+        self.deepseek_status = QLabel("")
+        self.deepseek_status.setObjectName("statusLabel")
+        deepseek_layout.addWidget(self.deepseek_status)
+
+        layout.addWidget(self.deepseek_group)
 
         # ── Sezione Download ──
-        dl_group = QGroupBox("Download Modello")
-        dl_layout = QVBoxLayout(dl_group)
+        self.download_group = QGroupBox("Download Modello")
+        dl_layout = QVBoxLayout(self.download_group)
 
         dl_btn_row = QHBoxLayout()
         self.download_btn = QPushButton("Scarica modello")
@@ -3368,13 +3465,12 @@ class SettingsTab(QWidget):
         self.dl_status.setObjectName("statusLabel")
         dl_layout.addWidget(self.dl_status)
 
-        layout.addWidget(dl_group)
+        layout.addWidget(self.download_group)
 
         # ── Sezione GPU ──
-        gpu_group = QGroupBox("Inferenza GPU")
-        gpu_layout = QVBoxLayout(gpu_group)
+        self.gpu_group = QGroupBox("Inferenza GPU")
+        gpu_layout = QVBoxLayout(self.gpu_group)
 
-        config = load_config()
         self.gpu_checkbox = QCheckBox("Usa GPU per inferenza (se disponibile)")
         self.gpu_checkbox.setChecked(config.get("gpu_offload", True))
         self.gpu_checkbox.stateChanged.connect(self._on_gpu_toggle)
@@ -3385,7 +3481,7 @@ class SettingsTab(QWidget):
         gpu_info.setWordWrap(True)
         gpu_layout.addWidget(gpu_info)
 
-        layout.addWidget(gpu_group)
+        layout.addWidget(self.gpu_group)
 
         rename_group = QGroupBox("Rinomina cartelle")
         rename_layout = QVBoxLayout(rename_group)
@@ -3428,6 +3524,100 @@ class SettingsTab(QWidget):
         layout.addWidget(log_group)
 
         layout.addStretch()
+        self._update_deepseek_status()
+        self._update_backend_ui()
+
+    def _on_backend_changed(self, _btn):
+        if _ai_analysis_running():
+            self.dl_status.setText("Attendi la fine dell'analisi AI prima di cambiare provider.")
+            current = get_ai_backend()
+            self._backend_btn_group.blockSignals(True)
+            self.local_backend_radio.setChecked(current == AI_BACKEND_LOCAL)
+            self.deepseek_backend_radio.setChecked(current == AI_BACKEND_DEEPSEEK)
+            self._backend_btn_group.blockSignals(False)
+            return
+
+        backend = AI_BACKEND_DEEPSEEK if self.deepseek_backend_radio.isChecked() else AI_BACKEND_LOCAL
+        set_ai_backend(backend)
+        unload_model()
+        self._update_backend_ui()
+
+    def _update_backend_ui(self):
+        backend = get_ai_backend()
+        use_local = backend == AI_BACKEND_LOCAL
+        self.local_model_group.setEnabled(use_local)
+        self.download_group.setEnabled(use_local)
+        self.gpu_group.setEnabled(use_local)
+        self.deepseek_group.setEnabled(not use_local)
+        self._update_download_buttons()
+        self._update_deepseek_status()
+
+    def _on_deepseek_model_changed(self, _index):
+        model = self.deepseek_model_combo.currentData()
+        if model:
+            set_deepseek_model(str(model))
+            if get_ai_backend() == AI_BACKEND_DEEPSEEK:
+                unload_model()
+            self._update_deepseek_status()
+
+    def _save_deepseek_key(self):
+        api_key = self.deepseek_key_edit.text().strip()
+        set_deepseek_api_key(api_key)
+        if get_ai_backend() == AI_BACKEND_DEEPSEEK:
+            unload_model()
+        self._update_deepseek_status()
+
+    def _clear_deepseek_key(self):
+        self.deepseek_key_edit.clear()
+        set_deepseek_api_key("")
+        if get_ai_backend() == AI_BACKEND_DEEPSEEK:
+            unload_model()
+        self._update_deepseek_status()
+
+    def _deepseek_key_for_action(self) -> str:
+        typed = self.deepseek_key_edit.text().strip()
+        return typed or get_deepseek_api_key()
+
+    def _update_deepseek_status(self):
+        if not hasattr(self, "deepseek_status"):
+            return
+        source = get_deepseek_api_key_source()
+        model = get_deepseek_model()
+        label = DEEPSEEK_MODELS.get(model, model)
+        if source == "config":
+            key_text = "chiave salvata"
+        elif source == "environment":
+            key_text = "chiave da variabile ambiente"
+        elif source == ".env":
+            key_text = "chiave da .env"
+        else:
+            key_text = "chiave non configurata"
+        self.deepseek_status.setText(f"{label} - {key_text}")
+
+    def _test_deepseek_connection(self):
+        if self._deepseek_test_worker is not None and self._deepseek_test_worker.isRunning():
+            return
+        api_key = self._deepseek_key_for_action()
+        if not api_key:
+            self.deepseek_status.setText("Inserisci una API key DeepSeek prima del test.")
+            return
+        model = str(self.deepseek_model_combo.currentData() or get_deepseek_model())
+        self.test_deepseek_btn.setEnabled(False)
+        self.deepseek_status.setText("Test connessione DeepSeek in corso...")
+        self._deepseek_test_worker = DeepSeekTestWorker(model, api_key)
+        self._deepseek_test_worker.finished.connect(self._on_deepseek_test_finished)
+        self._deepseek_test_worker.error.connect(self._on_deepseek_test_error)
+        self._deepseek_test_worker.start()
+
+    def _on_deepseek_test_finished(self, result: str):
+        self._deepseek_test_worker = None
+        self.test_deepseek_btn.setEnabled(True)
+        self.deepseek_status.setText(f"Connessione DeepSeek OK: {result[:60]}")
+
+    def _on_deepseek_test_error(self, msg: str):
+        self._deepseek_test_worker = None
+        self.test_deepseek_btn.setEnabled(True)
+        self.deepseek_status.setText(f"Errore DeepSeek: {msg}")
 
     def _open_logs_folder(self):
         """Apre la cartella dei log con il file manager del sistema."""
@@ -3965,8 +4155,12 @@ class MainWindow(QMainWindow):
 
         self._apply_theme()
 
-        # Primo avvio: se nessun modello scaricato, apri tab Impostazioni
-        if not get_downloaded_models():
+        # Primo avvio: apri Impostazioni se il backend scelto non e' pronto.
+        if (
+            get_ai_backend() == AI_BACKEND_LOCAL and not get_downloaded_models()
+        ) or (
+            get_ai_backend() == AI_BACKEND_DEEPSEEK and not is_deepseek_configured()
+        ):
             self.tabs.setCurrentWidget(self.settings_tab)
 
     def _send_explorer_folder_to_organize(self, path: str):

@@ -1,6 +1,22 @@
 import unittest
 
-from brain import LocalClassifier
+from brain import DeepSeekClassifier, LocalClassifier
+
+
+class StubDeepSeekClassifier(DeepSeekClassifier):
+    def __init__(self, reply: str):
+        super().__init__(model="deepseek-v4-flash", api_key="test-key")
+        self.reply = reply
+        self.calls = []
+
+    def _post_chat(self, messages, max_tokens, temperature=0.1, stop=None):
+        self.calls.append({
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stop": stop,
+        })
+        return {"choices": [{"message": {"content": self.reply}}]}
 
 
 class FolderRenameParserTests(unittest.TestCase):
@@ -42,6 +58,33 @@ class FolderRenameParserTests(unittest.TestCase):
         self.assertEqual(result["action"], "keep")
         self.assertEqual(result["suggested_name"], "Foto")
         self.assertEqual(result["confidence"], 1.0)
+
+
+class DeepSeekClassifierTests(unittest.TestCase):
+    def test_deepseek_classify_file_reuses_category_parser(self):
+        classifier = StubDeepSeekClassifier('{"category":"Documenti/PDF"}')
+
+        category = classifier.classify_file("fattura.pdf", 1200)
+
+        self.assertEqual(category, "Documenti/PDF")
+        self.assertEqual(classifier.calls[0]["max_tokens"], 100)
+
+    def test_deepseek_swap_reuses_swap_parser(self):
+        classifier = StubDeepSeekClassifier("B")
+
+        result = classifier.classify_for_swap(
+            "foto.jpg", "1 MB", "A", "B", ["doc.pdf"], ["mare.jpg"]
+        )
+
+        self.assertEqual(result, "B")
+
+    def test_deepseek_error_message_parser(self):
+        raw = '{"error":{"message":"invalid api key","type":"auth"}}'
+
+        self.assertEqual(
+            DeepSeekClassifier._extract_error_message(raw),
+            "invalid api key",
+        )
 
 
 if __name__ == "__main__":

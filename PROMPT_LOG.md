@@ -280,3 +280,144 @@ Ambito previsto del commit:
 
 Prima del commit e' stato controllato lo stato Git per evitare di includere
 cartelle generate o file fuori ambito.
+
+### Richiesta pacchetto ZIP per tester e lavoro su altro PC
+
+L'utente ha chiesto perche' rimandare la preparazione dello ZIP, dato che vuole
+lavorare al progetto anche da un altro PC e iniziare a distribuirlo ad alcuni
+tester.
+
+E' stato chiarito il modello consigliato:
+
+- mantenere la repo GitHub leggera, senza `dist/`, `.venv`, `.venv-build`,
+  `build/` e modelli;
+- usare GitHub per sincronizzare il codice tra PC di sviluppo;
+- creare uno ZIP portable separato dalla repo per i tester;
+- pubblicare eventualmente lo ZIP come asset di una GitHub Release, cosi' resta
+  scaricabile senza appesantire la storia Git.
+
+Controllo script esistenti:
+
+- `PACKAGING.md` descrive build portable, installer e modelli esterni.
+- `crea_zip_distribuzione.bat` crea uno ZIP dei sorgenti/script, utile per
+  sviluppo manuale ma non ideale per tester senza Python.
+- Per i tester serve invece uno ZIP della cartella
+  `dist\Agent Ordinatore`, generata da `build_exe.bat`.
+
+Proposta prima di agire:
+
+1. ricostruire la portable aggiornata;
+2. creare uno ZIP tester della cartella `dist\Agent Ordinatore`;
+3. aggiungere un file istruzioni/checksum accanto allo ZIP;
+4. non committare `dist/` o lo ZIP nella repo;
+5. se disponibile l'accesso GitHub, creare una Release e caricare lo ZIP come
+   asset; in alternativa lasciare lo ZIP locale pronto per invio manuale.
+
+### Nuova priorita': backend DeepSeek API oltre ai modelli locali
+
+Prima di creare lo ZIP tester, l'utente ha chiesto una modifica funzionale:
+
+- mantenere i modelli Qwen/GGUF locali;
+- aggiungere DeepSeek via API;
+- permettere nelle Impostazioni di scegliere tra backend locale e backend
+  DeepSeek;
+- supportare i modelli DeepSeek V4 Flash e V4 Pro.
+
+Verifica documentazione DeepSeek effettuata su fonte ufficiale:
+
+- base URL OpenAI-compatible: `https://api.deepseek.com`;
+- modelli correnti indicati: `deepseek-v4-flash` e `deepseek-v4-pro`;
+- i vecchi alias `deepseek-chat` e `deepseek-reasoner` risultano indicati come
+  in deprecazione dal 2026-07-24.
+
+Osservazioni sul codice esistente:
+
+- `brain.py` centralizza le chiamate AI in `LocalClassifier` e nei wrapper
+  `classify_file`, `classify_for_swap`, `classify_for_multi_swap` e
+  `suggest_folder_rename`;
+- `gui.py` controlla oggi solo che il modello locale sia scaricato prima delle
+  analisi;
+- `SettingsTab` gestisce scelta tier locale, download modello, GPU e opzioni;
+- l'integrazione DeepSeek conviene inserirla come backend alternativo centrale,
+  evitando dipendenze pesanti aggiuntive.
+
+Piano da approvare prima dell'implementazione:
+
+1. estendere `config.py` con backend AI selezionato, modello DeepSeek e API key
+   locale;
+2. aggiungere un client DeepSeek compatibile con le stesse funzioni del
+   classificatore locale;
+3. aggiornare `brain.py` per istanziare il backend corretto;
+4. aggiornare `gui.py` con scelta `Qwen locale` / `DeepSeek API`, selezione
+   Flash/Pro, campo API key mascherato e test connessione;
+5. aggiornare CLI e controlli modello pronto;
+6. aggiornare test, spec tecnica, prompt log, rebuild, ZIP tester e release/asset
+   solo dopo verifica.
+
+### Approvazione integrazione DeepSeek e richiesta `.env.example`
+
+L'utente ha approvato il piano e ha chiesto di creare anche `.env.example`, cosi'
+da poter creare manualmente un file `.env` e inserire la API key DeepSeek senza
+committarla.
+
+Implementazione prevista/avviata:
+
+- aggiunta eccezione `!.env.example` in `.gitignore`;
+- creato `.env.example` con `DEEPSEEK_API_KEY` e modello opzionale;
+- esteso `config.py` con provider AI (`local`/`deepseek`), modello DeepSeek,
+  API key salvata localmente e lettura `.env`;
+- aggiunto `DeepSeekClassifier` in `brain.py`, usando `urllib` e non SDK esterni;
+- mantenuti i wrapper AI esistenti per non duplicare la logica delle schede;
+- aggiornata la GUI con scelta `Qwen locale` / `DeepSeek API`, modello Flash/Pro,
+  campo API key mascherato e test connessione;
+- aggiornata la CLI: senza `--tier` usa il provider configurato, con `--tier`
+  forza il backend locale;
+- aggiornata la documentazione tecnica e README con privacy corretta per backend
+  locale/API.
+
+### Verifiche, rebuild e ZIP tester DeepSeek
+
+Verifiche eseguite dopo l'integrazione:
+
+- `py_compile` su `gui.py`, `main.py`, `brain.py`, `config.py`,
+  `model_manager.py`, `utils.py`: OK.
+- Test automatici: 23 test `unittest`, tutti OK.
+- Smoke test GUI offscreen:
+  - tab presenti: `Organizza`, `Swap`, `Swap multiplo`, `Rinomina cartelle`,
+    `File Explorer`, `Logs`, `Impostazioni`;
+  - backend default rilevato: `Qwen locale`;
+  - modello DeepSeek default: `deepseek-v4-flash`;
+  - stato chiave: non configurata.
+- `main.py --help`: OK.
+- `main.py setup`: OK, mostra provider AI configurato.
+
+Build:
+
+- Primo tentativo `build_exe.bat`: fallito per file in uso dentro
+  `dist\Agent Ordinatore`.
+- Processo trovato: `Agent Ordinatore.exe` con PID `8564`, ancora aperto dalla
+  precedente build.
+- Processo chiuso per liberare le DLL.
+- Secondo tentativo `build_exe.bat`: completato correttamente.
+- Nuovo EXE:
+  `dist\Agent Ordinatore\Agent Ordinatore.exe`.
+- Ultima modifica EXE: 2026-06-11 18:32:37.
+- Dimensione EXE: circa 10,6 MB.
+- Dimensione cartella portable: circa 142,84 MB.
+
+ZIP tester:
+
+- Copiati nella portable:
+  - `.env.example`;
+  - `GUIDA_TESTER.md`.
+- Creato ZIP:
+  `dist\AgentOrdinatore_Tester_20260611_183321.zip`.
+- Dimensione ZIP: circa 59,88 MB.
+- SHA256:
+  `EF1F1D819BDBCB1681DE3F349640656F42245476DD4C3C11A5EC4898C436B773`.
+- Creato file checksum:
+  `dist\AgentOrdinatore_Tester_20260611_183321.zip.sha256`.
+- Verificato che lo ZIP contenga:
+  - `Agent Ordinatore/Agent Ordinatore.exe`;
+  - `Agent Ordinatore/.env.example`;
+  - `Agent Ordinatore/GUIDA_TESTER.md`.

@@ -36,7 +36,17 @@ from model_manager import (
     MODELS, is_model_downloaded, download_model, delete_model,
     get_downloaded_models,
 )
-from config import get_selected_tier, is_folder_rename_allowed
+from config import (
+    AI_BACKEND_DEEPSEEK,
+    AI_BACKEND_LOCAL,
+    DEEPSEEK_MODELS,
+    get_ai_backend,
+    get_deepseek_api_key,
+    get_deepseek_api_key_source,
+    get_deepseek_model,
+    get_selected_tier,
+    is_folder_rename_allowed,
+)
 from logger import get_app_logger
 
 log = get_app_logger()
@@ -49,6 +59,29 @@ def _ensure_model(tier: str) -> bool:
     print(f"  Modello '{tier}' ({MODELS[tier]['name']}) non scaricato.")
     print(f"  Esegui: python main.py setup --download {tier}")
     return False
+
+
+def _ensure_ai_ready(tier_override: str | None = None) -> bool:
+    """Prepara il backend AI configurato. --tier forza il backend locale."""
+    if tier_override:
+        if not _ensure_model(tier_override):
+            return False
+        init_classifier(tier_override, backend=AI_BACKEND_LOCAL)
+        return True
+
+    if get_ai_backend() == AI_BACKEND_DEEPSEEK:
+        if not get_deepseek_api_key():
+            print("  API key DeepSeek non configurata.")
+            print("  Inseriscila nelle Impostazioni o in un file .env con DEEPSEEK_API_KEY.")
+            return False
+        init_classifier(backend=AI_BACKEND_DEEPSEEK, deepseek_model=get_deepseek_model())
+        return True
+
+    tier = get_selected_tier()
+    if not _ensure_model(tier):
+        return False
+    init_classifier(tier, backend=AI_BACKEND_LOCAL)
+    return True
 
 
 def _path_key(path: Path) -> str:
@@ -649,6 +682,17 @@ def setup_command(args) -> None:
     else:
         print(f"    GPU:  Non rilevata (inferenza solo CPU)")
 
+    backend = get_ai_backend()
+    if backend == AI_BACKEND_DEEPSEEK:
+        model = get_deepseek_model()
+        source = get_deepseek_api_key_source()
+        source_text = source if source else "non configurata"
+        print(f"\n  Provider AI: DeepSeek API")
+        print(f"    Modello: {DEEPSEEK_MODELS.get(model, model)}")
+        print(f"    API key: {source_text}")
+    else:
+        print(f"\n  Provider AI: Qwen locale")
+
     print(f"\n  Modelli disponibili:")
     tiers = get_available_tiers(hw)
     for t in tiers:
@@ -796,10 +840,8 @@ def main() -> None:
             log.error("CLI Organize: cartella non valida: %s", target)
             print(f"  Errore: '{target}' non e' una cartella valida.")
             return
-        tier = args.tier or get_selected_tier()
-        if not _ensure_model(tier):
+        if not _ensure_ai_ready(args.tier):
             return
-        init_classifier(tier)
         organize(target_folder=target, dry_run=not args.execute, use_copy=args.copy)
 
     elif args.command == "swap":
@@ -822,10 +864,8 @@ def main() -> None:
             log.error("CLI Swap: cartelle annidate: %s / %s", folder_a, folder_b)
             print(nested_error)
             return
-        tier = args.tier or get_selected_tier()
-        if not _ensure_model(tier):
+        if not _ensure_ai_ready(args.tier):
             return
-        init_classifier(tier)
         swap(
             folder_a,
             folder_b,
@@ -859,10 +899,8 @@ def main() -> None:
             print(nested_error)
             return
 
-        tier = args.tier or get_selected_tier()
-        if not _ensure_model(tier):
+        if not _ensure_ai_ready(args.tier):
             return
-        init_classifier(tier)
         multiswap(
             folders,
             dry_run=not args.execute,
@@ -879,10 +917,8 @@ def main() -> None:
         if not is_folder_rename_allowed():
             rename_folders(root, dry_run=not args.execute, include_root=args.include_root)
             return
-        tier = args.tier or get_selected_tier()
-        if not _ensure_model(tier):
+        if not _ensure_ai_ready(args.tier):
             return
-        init_classifier(tier)
         rename_folders(root, dry_run=not args.execute, include_root=args.include_root)
 
     elif args.command == "setup":

@@ -5,13 +5,15 @@ Ultimo aggiornamento: 2026-06-11
 ## Scopo
 
 Agent Ordinatore e' un'app desktop Windows per organizzare file e cartelle usando
-un modello AI locale in formato GGUF. L'app offre interfaccia grafica PySide6 e
-comandi CLI per classificare file, spostare o copiare elementi, scambiare file
-tra cartelle e proporre rinomine sicure di cartelle.
+un backend AI selezionabile: modello locale Qwen/GGUF oppure DeepSeek via API.
+L'app offre interfaccia grafica PySide6 e comandi CLI per classificare file,
+spostare o copiare elementi, scambiare file tra cartelle e proporre rinomine
+sicure di cartelle.
 
 Il progetto mantiene i modelli AI fuori dal pacchetto applicativo: l'eseguibile
-portable resta scaricabile, mentre i modelli vengono scaricati e salvati nella
-cartella dati utente.
+portable resta scaricabile, mentre i modelli locali vengono scaricati e salvati
+nella cartella dati utente. Le chiavi API DeepSeek restano locali e non sono
+versionate.
 
 ## Piattaforma supportata
 
@@ -26,12 +28,13 @@ cartella dati utente.
   impostazioni, download modelli e avvio/interruzione delle operazioni in thread.
 - `main.py`: interfaccia CLI con comandi `organize`, `swap`, `multiswap`,
   `rename-folders` e `setup`.
-- `brain.py`: prompt, parsing delle risposte del modello, classificazione file,
-  swap, multi-swap e suggerimenti di rinomina cartelle.
+- `brain.py`: prompt, parsing delle risposte del modello, backend AI locale/API,
+  classificazione file, swap, multi-swap e suggerimenti di rinomina cartelle.
 - `model_manager.py`: catalogo modelli, download da HuggingFace e gestione file
   GGUF locali.
 - `hardware.py`: rilevamento RAM, CPU, GPU NVIDIA e scelta tier consigliato.
-- `config.py`: configurazione persistente in `%LOCALAPPDATA%`.
+- `config.py`: configurazione persistente in `%LOCALAPPDATA%`, selezione backend
+  AI e lettura opzionale di `.env`.
 - `logger.py`: log applicativi e log movimenti.
 - `utils.py`: scansione cartelle, sanitizzazione path, spostamento/copia file,
   profili cartella e rinomina sicura.
@@ -67,7 +70,35 @@ Sottocartelle e file rilevanti:
 
 I modelli non devono essere inclusi in Git, `dist/` o installer.
 
-## Modelli AI
+## Backend AI
+
+Il backend AI e' configurabile nelle Impostazioni:
+
+- `Qwen locale`: usa modelli GGUF scaricati da HuggingFace e caricati con
+  `llama-cpp-python`.
+- `DeepSeek API`: usa `https://api.deepseek.com/chat/completions` con formato
+  compatibile OpenAI.
+
+Modelli DeepSeek supportati:
+
+- `deepseek-v4-flash`
+- `deepseek-v4-pro`
+
+La chiamata DeepSeek e' implementata con la libreria standard Python (`urllib`)
+per evitare nuove dipendenze runtime pesanti. Le richieste usano `stream=false`
+e `thinking` disabilitato per classificazioni brevi e deterministiche.
+
+La API key puo' essere configurata:
+
+- dal campo mascherato nelle Impostazioni, salvato in
+  `%LOCALAPPDATA%\AgentOrdinatore\config.json`;
+- con variabile ambiente `DEEPSEEK_API_KEY`;
+- con file `.env` in root progetto, accanto all'EXE portable o nella cartella
+  dati utente.
+
+`.env.example` e' versionato; `.env` resta ignorato da Git.
+
+## Modelli AI locali
 
 I tier definiti in `model_manager.py` sono:
 
@@ -153,9 +184,13 @@ esistenti, ma l'interfaccia mostra log operativi e dettaglio file/cartelle.
 
 ## Privacy
 
-- L'inferenza AI avviene localmente.
-- I file dell'utente non vengono inviati a server esterni.
-- La rete e' usata per scaricare modelli da HuggingFace.
+- Con backend `Qwen locale`, l'inferenza AI avviene localmente e i file
+  dell'utente non vengono inviati a server esterni.
+- Con backend `DeepSeek API`, l'app invia a DeepSeek i nomi file, dimensioni,
+  nomi cartelle e campioni dei contenuti necessari alla classificazione.
+- Le API key non devono essere committate. `.env` e' ignorato da Git.
+- La rete e' usata per scaricare modelli da HuggingFace e, se selezionato, per
+  chiamare DeepSeek.
 
 ## Build portable
 
@@ -179,6 +214,14 @@ Output:
 ```text
 dist\Agent Ordinatore\Agent Ordinatore.exe
 ```
+
+Per distribuzione tester viene creato uno ZIP della cartella
+`dist\Agent Ordinatore`. Prima della compressione vengono copiati nella portable:
+
+- `.env.example`, per configurare manualmente `DEEPSEEK_API_KEY`;
+- `GUIDA_TESTER.md`, con istruzioni di avvio, scelta provider e note privacy.
+
+Lo ZIP resta fuori da Git e puo' essere pubblicato come asset di GitHub Release.
 
 La build usa PyInstaller `onedir`, non `onefile`, per ridurre falsi positivi
 antivirus, migliorare tempi di avvio e gestire meglio librerie native Qt e
@@ -242,7 +285,7 @@ Risultato ultimo controllo:
 
 - Import runtime e GUI: OK.
 - CLI help: OK.
-- Test automatici: 20 test, tutti OK.
+- Test automatici: 23 test `unittest`, inclusi parser locali e mock DeepSeek.
 
 ## File da non distribuire
 
@@ -255,6 +298,7 @@ Risultato ultimo controllo:
 - `models\`
 - `%LOCALAPPDATA%\AgentOrdinatore\models`
 - `%LOCALAPPDATA%\AgentOrdinatore\logs`
+- `.env`
 
 ## Manutenzione
 
