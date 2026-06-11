@@ -421,3 +421,18 @@ ZIP tester:
   - `Agent Ordinatore/Agent Ordinatore.exe`;
   - `Agent Ordinatore/.env.example`;
   - `Agent Ordinatore/GUIDA_TESTER.md`.
+
+### Commit/push e tentativo Release GitHub
+
+- Commit creato:
+  `9cfbb3c Add DeepSeek API backend and tester zip support`.
+- Push completato su `origin/main`.
+- Stato dopo push: `main` allineato a `origin/main`.
+
+Tentativo Release:
+
+- `gh` non risulta installato su questa macchina.
+- Il connettore GitHub disponibile espone strumenti per repository, issue, PR e
+  file, ma non per creare release o caricare asset binari.
+- La Release GitHub con asset ZIP non e' stata creata in questa sessione.
+- Lo ZIP tester e il file `.sha256` restano pronti localmente in `dist\`.
